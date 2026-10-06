@@ -261,3 +261,52 @@ def test_executor_guards(tmp_path, monkeypatch):
     assert r[0].status == "skipped" and r[0].error == "kill_switch"
     with pytest.raises(ValueError):
         ConvexExecutor(ExecConfig(live=True), AccountConfig(), FakeInfo({}))
+
+
+def test_executor_funding_gate_leverage_cap_dust_and_cooldown_restore(tmp_path):
+    from portfolio import PositionBook
+    from risk_manager import ConvexRiskManager
+    from squeeze_scanner import Store
+    rows = {"KKK": row_for("KKK", 0), "GGG": row_for("GGG", 0)}
+
+    # funding gate: a long paying +0.05 %/h on a 3.75-unit R at $110 costs 0.05%×24×110/3.75 = 0.35R → ok; +0.1 %/h = 0.70R → skipped
+    ex = ConvexExecutor(ExecConfig(live=False), AccountConfig(equity_usd=5000), FakeInfo({"KKK": "110.0"}))
+    hot = {"KKK": row_for("KKK", 0, funding="0.001")}
+    r = run(ex.handle([signal()], hot, signal().ts))[0]
+    assert r.status == "skipped" and "funding" in r.error and "0.70R" in r.error
+    from dataclasses import replace
+    short_ok = {"KKK": row_for("KKK", 0, funding="0.001")}                       # a short RECEIVES positive funding
+    s_short = replace(signal(direction=-1, stop=115.0), donchian_lower=115.0)    # ref 110 is below the band: a real downside break
+    r = run(ConvexExecutor(ExecConfig(live=False), AccountConfig(equity_usd=5000), FakeInfo({"KKK": "110.0"}))
+            .handle([s_short], short_ok, signal().ts))[0]
+    assert r.status == "dry"
+
+    # portfolio gross-leverage cap: 3× equity across ALL positions, not per position
+    risk = ConvexRiskManager()
+    book = PositionBook(risk, AccountConfig(equity_usd=1000.0, risk_pct=0.01), FakeInfo({"GGG": "110.0"}), None)
+    book.register("GGG", 1, 110.0, 25.0, 2.5, signal().ts - HOUR_MS, 0, 1)        # $2,750 already open
+    ex2 = ConvexExecutor(ExecConfig(live=False), AccountConfig(equity_usd=1000.0, risk_pct=0.01), FakeInfo({"KKK": "110.0", "GGG": "110.0"}),
+                         risk=risk, book=book)
+    r = run(ex2.handle([signal()], rows, signal().ts))[0]
+    assert r.status == "dry" and r.notional <= 1000 * 3 - 2750 + 1e-6 and r.notional >= 10   # only $250 of budget left
+    assert "notional capped" in r.raw or r.sz == 2.2                                            # 250 / 110.08 → 2.2 coins
+
+    # dust guard (live): a partial fill below HL's $10 minimum cannot carry a reduce-only stop → closed immediately
+    cheap = row_for("KKK", 0, markPx="5.0", midPx="5.0")
+    gw = FakeGateway(fill_frac=0.1)
+    ex3 = ConvexExecutor(ExecConfig(live=True), AccountConfig(equity_usd=5000), FakeInfo({"KKK": "5.0"}), gateway=gw, account_address="0xabc")
+    s = replace(signal(ref=5.0, stop=4.5), donchian_upper=4.8)      # R = 1.5 × 2.5 = 3.75 → 13.3 coins = $66; 10 % fill = 1.3 coins = $6.5 < $10
+    r = run(ex3.handle([s], {"KKK": cheap}, s.ts))[0]
+    assert r.status == "dust_closed" and "below the $10 minimum" in r.error
+    kinds = [c[0] for c in gw.calls]
+    assert kinds == ["lev", "order", "order"] and gw.calls[2][6] is True and "trigger" not in gw.calls[2][5]   # IOC reduce-only, no stop
+
+    # cooldown restore: a trade closed 2 h ago in the store blocks the coin for 24 bars after a restart
+    store = Store(str(tmp_path / "cd.db"))
+    store.write_trade({"opened_ms": signal().ts - 5 * HOUR_MS, "closed_ms": signal().ts - 2 * HOUR_MS, "coin": "KKK", "mode": "dry",
+                       "side": "long", "entry_px": 100, "exit_px": 99, "size": 1, "r_unit": 1, "pnl_usd": -1, "r_multiple": -1,
+                       "fees_usd": 0, "stage": 0, "reason": "stop"})
+    ex4 = ConvexExecutor(ExecConfig(live=False), AccountConfig(equity_usd=5000), FakeInfo({"KKK": "110.0"}), store)
+    r = run(ex4.handle([signal()], rows, signal().ts))[0]
+    assert r.status == "skipped" and r.error.startswith("cooldown until")
+    store.close()

@@ -1,10 +1,11 @@
 # s38-squeeze — Hyperliquid BB/KC squeeze + funding-fuel scanner (read-only, no orders).
 PY := $(shell [ -x .venv/bin/python3 ] && echo .venv/bin/python3 || echo python3)
-.PHONY: help setup test once run events scans signals orders positions trades wfo wfo-apply
+.PHONY: help setup test stress once run events scans signals orders positions trades wfo wfo-apply
 
 help:
 	@echo "  make setup    venv + requirements"
 	@echo "  make test     offline tests (indicator math + fake /info server pipeline)"
+	@echo "  make stress   expectancy / losing-streak / drawdown Monte Carlo on the stated profile"
 	@echo "  make once     one cycle, print table   (ARGS=\"--convex\" adds the breakout engine, dry)"
 	@echo "  make run      loop every 60s (Ctrl-C to stop); hospitality1 unit + installer in deploy/"
 	@echo "  make events   last 30 state transitions from state/s38.db"
@@ -21,6 +22,9 @@ setup:
 
 test:
 	$(PY) -m pytest -q -p no:cacheprovider tests
+
+stress:
+	$(PY) stress_test.py $(ARGS)
 
 once:
 	$(PY) squeeze_scanner.py --once $(ARGS)

@@ -25,7 +25,8 @@ weekly wfo.py: replay of the logged window over Donchian 16–32 × Chandelier 2
 
 ```bash
 make setup                 # python3 -m venv .venv && pip install -r requirements.txt
-make test                  # 42 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
+make test                  # 45 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
+make stress                # expectancy / streak / drawdown Monte Carlo on the stated profile (no market data)
 make once                  # one cycle, prints the table (first run loads ~2 candle series per coin)
 make once ARGS=--convex    # same, plus the breakout engine in dry mode
 make run ARGS=--convex     # loop every 60s; Ctrl-C to stop
@@ -34,7 +35,7 @@ make run ARGS=--convex     # loop every 60s; Ctrl-C to stop
 
 Useful flags: `--min-vol/--max-vol` (default 2e6/40e6), `--exclude BTC,ETH,SOL`, `--max-spread-bps 60`,
 `--tfs 1h,4h` (the **first** TF gates the engine and the fuel range test), `--equity 5000` (dry-mode equity; live
-reads the account), `--risk-pct 1` (bootstrap risk until 20 realized trades) / `--max-risk-pct 4` (Kelly cap),
+reads the account), `--risk-pct 1` (bootstrap risk until 20 realized trades) / `--max-risk-pct 2` (Kelly cap),
 `--long-only` (default: both sides), `--weight 600` (API budget, see below), `--db state/s38.db` (`--db ''`
 disables), `--coins AAA,BBB` (debug: restrict), `--quiet` (no table, log lines only — use under systemd),
 `--convex` / `--live` / `--max-positions 3` / `--max-slippage-bps 8` (convex engine), `--scans` / `--events N` /
@@ -105,10 +106,10 @@ equity and open positions; dry: `--equity` and simulated positions) → fresh mi
 already in position, in cooldown (24 bars after a fill, 1 bar after an unfilled/failed attempt), at
 `--max-positions`, or if price has already fallen back inside the Donchian range → size → send.
 
-- **Sizing**: from the risk manager — `size = equity × risk_frac / (1.5 × ATR14)`, notional capped at
-  `min(equity × 5, 0.05 % of 24h volume)`, floored to `szDecimals`, HL $10 minimum (`too_small or no edge`
-  otherwise). Leverage is set per coin to `min(5, maxLeverage)` (cross; isolated for `onlyIsolated` assets) before
-  its first order.
+- **Sizing**: from the risk manager — `size = equity × risk_frac × throttle / (1.5 × ATR14)`, notional capped at
+  `min(portfolio budget left of equity × 3, 0.05 % of 24h volume)`, floored to `szDecimals`, HL $10 minimum
+  (`too_small or no edge` otherwise). Leverage is set per coin to `min(5, maxLeverage)` (cross; isolated for
+  `onlyIsolated` assets) before its first order.
 - **Entry**: one **IOC limit** at `mid × (1 + 0.08 %)` for buys / `mid × (1 − 0.08 %)` for sells, rounded *toward*
   the mid under HL's tick rule (≤ 5 significant figures, ≤ 6 − szDecimals decimals). Hyperliquid's "market" order
   is exactly this slippage-bounded IOC. Whatever fills within the bound is kept (`filled` / `partial`); the rest is
@@ -135,22 +136,33 @@ lose small and the book lives off the runners, so the exit logic never takes pro
 
 - **Sizing — quarter-Kelly on realized trades.** `f* = p_lb − (1 − p_lb) / b` with `p_lb` the win rate minus one
   standard error (pessimistic) and `b` = mean winning R / mean losing R, both from the `trades` table of the
-  current mode; risk fraction = `0.25 · f*`, **capped at 4 % of equity** on the initial stop distance, zero when
-  the realized edge is not positive (then nothing is traded). Until **20 trades** exist the bootstrap fraction
-  (`--risk-pct`, default 1 %) is used — seeding Kelly with the *target* profile would size at the cap from day one
-  on an unvalidated edge. The notional caps from before still apply (≤ 5× equity, ≤ 0.05 % of 24h volume).
-  At the target profile the maths gives 3.7 % after 100 trades and hits the 4 % cap after ~300.
+  current mode; risk fraction = `0.25 · f*`, **capped at 2 % of equity** on the initial stop distance (the red-team
+  section explains why not 4 %), zero when the realized edge is not positive (then nothing is traded). Until
+  **20 trades** exist the bootstrap fraction (`--risk-pct`, default 1 %) is used — seeding Kelly with the *target*
+  profile would size at the cap from day one on an unvalidated edge. A **drawdown throttle** multiplies the fraction
+  by `max(0.25, 1 − DD / 15 %)`, DD measured from the 30-day equity peak (persisted in `equity_curve`). Notional
+  is further capped by the **portfolio** gross-leverage budget (`equity × 3` across all open positions) and by
+  liquidity (0.05 % of 24h volume). An entry whose adverse funding would cost more than **0.5R per day** at the
+  current rate is skipped.
 - **Initial invalidation stop: 1.5 × ATR(14)** from the actual fill (not the reference price). R = that distance.
   The size is chosen so that the stop loses exactly the risk fraction.
 - **Exit ratchet** (stop only ever moves in the trade's favour; evaluated on every new closed bar — the bar's
   adverse extreme is tested against the *previous* stop before its favourable extreme is credited — and on the
   live mark between bars):
-  - best excursion ≥ **+2.0R** → stop to **entry + 0.1R** (break-even after taker fees in and out);
+  - best excursion ≥ **+2.0R** → stop to **entry + max(0.1R, round-trip cost)**: 0.1R only covers the 0.19 %
+    round trip (2 × 3.5 bps fees + 2 × 6 bps slippage) when the stop is ≥ 1.9 % wide, so on tighter stops the
+    offset is the cost itself;
   - best excursion ≥ **+3.0R** → **Chandelier**: `best excursion − 2.5 × ATR(14)` (mirror for shorts),
     recomputed with the current ATR each cycle, never lowered.
   Live: when the stop moves ≥ 0.1 % the resting reduce-only stop-market is replaced — new order first, cancel the
-  old one second — so the position is never unprotected. A position that disappears from the account is closed from
-  its `userFillsByTime` fills (fallback: the stop price) and the leftover stop is cancelled.
+  old one second — so the position is never unprotected. Every 5 minutes the book confirms that each stop still
+  rests on the exchange (`openOrders`) and re-places any that vanished (restart, manual cancel). If the mark is
+  more than 0.1 % **through** a stop while the position is still on the account — a cascade wick that gapped past
+  the trigger's 5 % limit — the book takes the exit itself with a reduce-only IOC at mark ∓ 1 % instead of waiting.
+  A position that disappears from the account is closed from its `userFillsByTime` fills (fallback: the stop
+  price) and the leftover stop is cancelled. A partial fill below HL's $10 minimum, which could not carry a
+  reduce-only stop, is closed immediately (`dust_closed`). Per-coin cooldowns are rebuilt from the trade log on
+  restart.
 - **Circuit breaker — 6 % in 24 h.** Mark-to-market equity (live: `accountValue`; dry: start + realized +
   unrealized − fees) is sampled every cycle; a drawdown ≥ 6 % from the rolling 24 h peak **flattens every position
   (reduce-only IOC, 1 % bound), cancels every open order on the account and halts entries for 12 h**. Cancelling the
@@ -161,8 +173,40 @@ lose small and the book lives off the runners, so the exit logic never takes pro
   them with win rate ± SE, avg R ± SE and payoff, for all trades and per leg. These are the numbers the Kelly
   sizing reads.
 
-Interaction worth knowing: at the 4 % cap, two full-size losses inside 24 h (−8 %) trip the breaker — one and a
-half losses is the real daily budget. With the 1 % bootstrap it takes six.
+Interaction worth knowing: at the 2 % cap, three full-size losses inside 24 h (−6 %) trip the breaker. With the
+1 % bootstrap it takes six.
+
+## Red-team stress test (`stress_test.py`, `make stress`)
+
+Assumptions as stated for the stress: 35 % win rate, target win +4.5R gross, loss −1.0R net, taker 0.035 % per
+leg, slippage 0.06 % per leg (0.19 % round trip). Re-run with other numbers: `python3 stress_test.py --p … --win …`.
+
+- **Expectancy.** Friction in R depends on the stop width (R = 1.5 × ATR14): 0.25R at ATR 0.5 %, 0.08R at 1.5 %,
+  0.03R at 4 %. At ATR 1.5 %: `E = 0.35 × 4.42 − 0.65 × 1.0 = +0.895R` per trade, **+179R ± 36.5R (1σ) over 200
+  trades**. Break-even payoff at 35 % is 1.94R gross, break-even win rate at 4.5R is 18.5 % — the 4.5R target has
+  2.4R of slack and friction is not what breaks it. What breaks it is the target being an assumption: the realized
+  payoff is the number to watch (`make trades`).
+- **Streaks.** `P(7 straight losses in a given window) = 0.65⁷ = 4.9 %`, but **P(a run of ≥ 7 somewhere in 200
+  trades) = 98 %**; ≥ 10: 62 %; ≥ 15: 10 %. The median longest losing streak in 200 trades is 10, the 95th
+  percentile 16. Seven is routine; ten is the number to size for.
+- **The "quarter-Kelly keeps drawdown below 15 %" claim was false as originally configured.** Quarter-Kelly at the
+  target profile is 5.1 %, capped at 4 %: seven straight −1R losses compound to **−24.9 %**; Monte Carlo over 200
+  trades gives P(max DD ≥ 15 %) = 100 % and a median max DD of 36 %. Keeping a 7-streak under 15 % needs f ≤ 2.29 %,
+  a 10-streak f ≤ 1.61 %. Hence the two patches: cap **2 %** and the **drawdown throttle** (×(1 − DD/15 %), floor
+  ×0.25). With both, straight-loss drawdowns are 9.2 % (7L), 11.1 % (10L), 13.3 % (15L), and over 200 trades
+  P(max DD ≥ 15 %) = 4.9 %, 95th-percentile max DD = 15.0 %, median 11.9 %, at a median 11× instead of 27×. That is
+  an engineered asymptote, not a theorem: losses larger than 1R (gaps) can still breach it, and the 6 %/24 h breaker
+  remains the hard daily stop. In the no-edge scenario (30 % / 2.3R) the un-throttled 4 % cap has an 88 % chance
+  of a > 50 % drawdown in 200 trades — the reason Kelly here feeds on realized trades only.
+- **Structural loopholes found and patched** (all tested against the fake gateway): break-even offset below the
+  round-trip cost on narrow stops; per-position leverage cap that allowed 3 × 5× = 15× gross; no funding cost at
+  entry (HL funding on mid-caps can reach ±0.5 %/h in exactly the squeezes this strategy enters); stop-market
+  gapped past its 5 % limit in a liquidation cascade leaving the position open with no further action; resting
+  stop silently gone after a restart or manual cancel; partial fill below the $10 minimum left with a stop that
+  the exchange would reject; cooldowns and the breaker's 24 h window lost on restart; a 429-starved candle refresh
+  silently refusing every breakout as stale (now a WARNING naming the budget). There is no WebSocket in this design
+  — state comes from REST snapshots every cycle — so the desync failure mode is the REST one: it is covered by the
+  5-minute stop verification and the gap exit above.
 
 ## Trade log & walk-forward optimisation (`wfo.py`, weekly timer)
 

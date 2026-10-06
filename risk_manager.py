@@ -24,23 +24,38 @@ from typing import Optional
 @dataclass(frozen=True)
 class RiskConfig:
     kelly_fraction: float = 0.25
-    max_risk_frac: float = 0.04        # cap: equity fraction risked per trade on the initial stop distance
+    # Cap on the equity fraction risked per trade on the initial stop distance. 2 %, not 4 %: at a 65 % loss rate a
+    # 7-loss streak is near-certain in 200 trades (98 %) and the median longest streak is 10; compounding 4 % per
+    # loss a 7-streak alone is −24.9 %, 2 % keeps it at −13.2 % and, with the drawdown throttle below, under 15 %.
+    max_risk_frac: float = 0.02
     bootstrap_risk_frac: float = 0.01  # used until min_trades realized trades exist
     min_trades: int = 20
     win_rate_z: float = 1.0            # size on win rate − z·SE (pessimistic)
+    dd_throttle_at: float = 0.15       # risk fraction shrinks linearly to the floor as drawdown approaches this
+    dd_throttle_floor: float = 0.25    # … and never below this multiple of the computed fraction
     atr_len: int = 14
     stop_atr_mult: float = 1.5         # initial invalidation stop
     be_trigger_R: float = 2.0          # best excursion that moves the stop to break-even
-    be_offset_R: float = 0.1           # break-even offset covering taker fees in and out
+    be_offset_R: float = 0.1           # break-even offset in R … but never less than the round-trip cost (see below)
     trail_trigger_R: float = 3.0       # best excursion that switches to the Chandelier trail
     trail_atr_mult: float = 2.5        # Chandelier distance behind the best excursion
     min_stop_move_frac: float = 0.001  # replace a resting stop only for ≥ 0.1 % moves (order churn)
     breaker_dd: float = 0.06
     breaker_window_s: float = 24 * 3600.0
     breaker_halt_s: float = 12 * 3600.0
-    taker_fee: float = 0.00045         # per side, HL base tier
+    taker_fee: float = 0.00035         # per side (0.07 % round trip); the WFO job re-calibrates from realized fees
+    entry_slippage: float = 0.0006     # expected adverse fill vs the reference mid, per side
+    exit_slippage: float = 0.0006
     paper_slippage: float = 0.0005     # dry exits: 5 bps adverse to the stop/mark
-    flatten_slippage: float = 0.01     # IOC bound for breaker flattening
+    flatten_slippage: float = 0.01     # IOC bound for breaker flattening and emergency exits
+    max_funding_R_per_day: float = 0.5 # skip an entry whose adverse funding over 24 h would cost more than this
+    stop_gap_tolerance: float = 0.001  # live: mark this far through the stop with the position still open ⇒ emergency exit
+    verify_stops_s: float = 300.0      # live: how often to confirm every resting stop still exists on the exchange
+
+    @property
+    def round_trip_cost(self) -> float:
+        """Fees in and out plus expected slippage in and out, as a fraction of notional."""
+        return 2 * self.taker_fee + self.entry_slippage + self.exit_slippage
 
 
 @dataclass(frozen=True)
@@ -141,10 +156,25 @@ class ConvexRiskManager:
     def initial_stop(self, entry_px: float, direction: int, atr: float) -> float:
         return entry_px - direction * self.cfg.stop_atr_mult * atr
 
+    def drawdown_throttle(self, drawdown: float) -> float:
+        """Multiplier on the risk fraction: 1 at the equity peak, linearly down to the floor at dd_throttle_at."""
+        c = self.cfg
+        if drawdown <= 0:
+            return 1.0
+        return max(c.dd_throttle_floor, 1.0 - drawdown / c.dd_throttle_at)
+
+    def funding_cost_R(self, direction: int, funding_hourly: float, px: float, r_unit: float, hours: float = 24.0) -> float:
+        """Adverse funding over `hours` expressed in R (longs pay positive funding, shorts pay negative)."""
+        adverse = max(0.0, direction * funding_hourly)
+        return adverse * hours * px / r_unit if r_unit > 0 else 0.0
+
     def size(self, equity: float, entry_px: float, atr: float, stats: TradeStats, sz_decimals: int,
-             max_notional: float, min_notional: float = 10.0) -> Optional[SizeDecision]:
-        """Units to trade so that equity × risk_frac is lost at the initial stop, under the notional cap."""
+             max_notional: float, min_notional: float = 10.0, throttle: float = 1.0) -> Optional[SizeDecision]:
+        """Units to trade so that equity × risk_frac × throttle is lost at the initial stop, under the notional cap."""
         frac, note = self.risk_fraction(stats)
+        frac *= max(0.0, min(1.0, throttle))
+        if throttle < 1.0:
+            note += f"; throttle ×{throttle:.2f}"
         r_unit = self.cfg.stop_atr_mult * atr
         if frac <= 0 or r_unit <= 0 or equity <= 0 or entry_px <= 0:
             return None
@@ -172,7 +202,9 @@ class ConvexRiskManager:
         if exc >= c.trail_trigger_R:
             stage, cand = 2, pos.best_px - pos.direction * c.trail_atr_mult * atr
         elif exc >= c.be_trigger_R:
-            stage, cand = 1, pos.entry_px + pos.direction * c.be_offset_R * pos.r_unit
+            # break-even must clear the real round-trip cost: 0.1R only does when the stop is ≥ 1.9 % wide
+            offset = max(c.be_offset_R * pos.r_unit, c.round_trip_cost * pos.entry_px)
+            stage, cand = 1, pos.entry_px + pos.direction * offset
         else:
             stage, cand = 0, pos.initial_stop
         stage = max(stage, pos.stage)

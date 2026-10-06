@@ -364,37 +364,47 @@ class ConvexExecutor:
         self.risk = risk or ConvexRiskManager(RiskConfig(bootstrap_risk_frac=acct.risk_pct))
         self.book = book
         self._cooldown: dict = {}       # coin -> until ms
+        if store is not None:           # cooldowns survive a restart: last close per coin + cooldown_bars
+            mode = "live" if cfg.live else "dry"
+            for coin, closed_ms in store.last_close_times(mode).items():
+                self._cooldown[coin] = closed_ms + cfg.cooldown_bars * HOUR_MS
         self._dry_positions: dict = {}  # coin -> opened ms (dry mode stand-in when no book is attached)
         self._lev_set: set = set()
         self.reports: list = []
 
     # ── account state ──
-    async def _account(self, t_ms: int) -> tuple:
+    async def _account(self, t_ms: int, mids: Optional[dict] = None) -> tuple:
+        """→ (equity, {coin: size}, gross open notional)."""
+        mids = mids or {}
         if self.cfg.live and self.account_address:
             st = await self.info.user_state(self.account_address)
             equity = float(st["marginSummary"]["accountValue"])
-            positions = {}
+            positions, gross = {}, 0.0
             for ap in st.get("assetPositions", []):
                 p = ap.get("position", {})
                 szi = float(p.get("szi", 0) or 0)
                 if szi:
                     positions[p["coin"]] = szi
-            return equity, positions
+                    gross += abs(float(p.get("positionValue", 0) or 0)) or abs(szi) * float(mids.get(p["coin"], 0) or 0)
+            return equity, positions, gross
         if self.book is not None:
-            return self.book.equity_dry({}), {c: p.size for c, p in self.book.positions.items()}
+            return (self.book.equity_dry(mids), {c: p.size for c, p in self.book.positions.items()},
+                    self.book.gross_notional(mids))
         horizon = self.cfg.cooldown_bars * HOUR_MS
         self._dry_positions = {c: t for c, t in self._dry_positions.items() if t_ms - t < horizon}
-        return self.acct.equity_usd, dict(self._dry_positions)
+        return self.acct.equity_usd, dict(self._dry_positions), 0.0
 
     # ── sizing ──
-    def plan(self, s: ConvexSignal, ctx: AssetCtx, equity: float, ref_px: float) -> Optional[OrderPlan]:
+    def plan(self, s: ConvexSignal, ctx: AssetCtx, equity: float, ref_px: float, gross_open: float = 0.0) -> Optional[OrderPlan]:
         is_buy = s.direction > 0
         if not (s.atr > 0) or not math.isfinite(s.atr):
             return None
         from risk_manager import TradeStats
         stats = self.book.stats() if self.book is not None else TradeStats()
-        cap = min(equity * self.acct.max_leverage, ctx.day_ntl_vlm * self.acct.max_vlm_frac)
-        dec = self.risk.size(equity, ref_px, s.atr, stats, ctx.sz_decimals, cap, self.acct.min_notional_usd)
+        # per-position cap = what is left of the PORTFOLIO gross-leverage budget, and the liquidity cap
+        cap = min(max(0.0, equity * self.acct.max_leverage - gross_open), ctx.day_ntl_vlm * self.acct.max_vlm_frac)
+        throttle = self.book.throttle() if self.book is not None else 1.0
+        dec = self.risk.size(equity, ref_px, s.atr, stats, ctx.sz_decimals, cap, self.acct.min_notional_usd, throttle)
         if dec is None:
             return None
         sd = ctx.sz_decimals
@@ -432,13 +442,15 @@ class ConvexExecutor:
             log.warning("%s — %d signal(s) not executed", why, len(signals))
             reports = [self._skip(s, t_ms, why) for s in signals]
         else:
-            equity, positions = await self._account(t_ms)
             if mids is None:
                 mids = await self.info.all_mids()
+            equity, positions, gross_open = await self._account(t_ms, mids)
             opened = 0
             for s in signals:
                 ctx = rows_by_coin[s.coin].ctx
                 ref = float(mids.get(s.coin) or ctx.mid_px or ctx.mark_px)
+                r_unit = self.risk.cfg.stop_atr_mult * s.atr
+                fund_R = self.risk.funding_cost_R(s.direction, ctx.funding, ref, r_unit)
                 if s.coin in positions:
                     rep = self._skip(s, t_ms, "in_position")
                 elif self._cooldown.get(s.coin, 0) > t_ms:
@@ -447,14 +459,17 @@ class ConvexExecutor:
                     rep = self._skip(s, t_ms, f"max_positions={self.cfg.max_positions}")
                 elif (s.direction > 0 and ref <= s.donchian_upper) or (s.direction < 0 and ref >= s.donchian_lower):
                     rep = self._skip(s, t_ms, f"ref {ref:g} back inside the range")
+                elif fund_R > self.risk.cfg.max_funding_R_per_day:
+                    rep = self._skip(s, t_ms, f"funding {ctx.funding * 800:+.3f}%/8h would cost {fund_R:.2f}R per day")
                 else:
-                    plan = self.plan(s, ctx, equity, ref)
+                    plan = self.plan(s, ctx, equity, ref, gross_open)
                     if plan is None:
                         rep = self._skip(s, t_ms, "too_small or no edge")
                     else:
                         rep = await self._send(plan, s, t_ms)
                         if rep.status in ("dry", "filled", "partial"):
                             opened += 1
+                            gross_open += rep.filled_sz * (rep.avg_px or plan.ref_px)
                 reports.append(rep)
         for rep in reports:
             self.reports.append(rep)
@@ -523,6 +538,19 @@ class ConvexExecutor:
             self._cooldown[plan.coin] = t_ms + self.cfg.cooldown_bars * HOUR_MS
             log.warning("FILLED %s %s %g/%g @ %g (slip %+.1f bps, oid %s) [%s]", plan.side.upper(), plan.coin, filled,
                         plan.sz, avg, rep.slippage_bps, oid, plan.size_note)
+            if filled * avg < self.acct.min_notional_usd:
+                # dust: below HL's minimum order value a reduce-only stop would be rejected ⇒ unprotected — close it now
+                bound = round_px(avg * (1 - self.risk.cfg.flatten_slippage), plan.sz_decimals, "down") if plan.is_buy else \
+                    round_px(avg * (1 + self.risk.cfg.flatten_slippage), plan.sz_decimals, "up")
+                try:
+                    cresp = await loop.run_in_executor(None, gw.order, plan.coin, not plan.is_buy, filled, bound, IOC, True)
+                    cstatus, cfilled, cavg, coid, cerr = parse_order_response(cresp)
+                    rep.status, rep.error = "dust_closed", f"partial fill ${filled * avg:.2f} below the ${self.acct.min_notional_usd:.0f} minimum — closed @ {cavg} ({cstatus} {cerr or ''})".strip()
+                    log.warning("DUST %s %s %g closed: %s", plan.side, plan.coin, filled, rep.error)
+                except Exception as e:
+                    rep.status, rep.error = "dust", f"POSITION UNPROTECTED — dust fill {filled:g} could not be closed: {e}"
+                    log.critical("%s %s: %s", plan.coin, plan.side, rep.error)
+                return rep
             stop_px, stop_limit = self._stop_for_fill(plan, avg)
             rep.stop_px = stop_px
             stop_type = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}

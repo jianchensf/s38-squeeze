@@ -38,6 +38,8 @@ class PositionBook:
         self._r_multiples: list = []
         self.last_equity = acct.equity_usd
         self._warned: set = set()
+        self.peak_equity = acct.equity_usd
+        self._last_verify_ms = 0
         state = None
         if store:
             for p in store.open_positions(self.mode):
@@ -46,6 +48,13 @@ class PositionBook:
             self.realized_usd = store.realized_pnl(self.mode)
             state = store.breaker_state()
         self.breaker = CircuitBreaker(self.cfg, state)
+        if store:
+            from squeeze_scanner import now_ms
+            t = now_ms()
+            # the breaker's 24 h window and the throttle's 30 d peak survive a restart
+            for ts, eq in store.equity_samples(self.mode, t - int(self.cfg.breaker_window_s * 1000)):
+                self.breaker._eq.append((int(ts), float(eq)))
+            self.peak_equity = max(self.peak_equity, store.equity_peak(self.mode, t - 30 * 24 * 3600 * 1000))
         if self.positions:
             log.info("restored %d open %s position(s): %s", len(self.positions), self.mode, ", ".join(sorted(self.positions)))
         if state and state.halt_until_ms:
@@ -72,6 +81,15 @@ class PositionBook:
     def equity_dry(self, marks: dict) -> float:
         unreal = sum(p.pnl_usd(marks.get(p.coin, p.entry_px)) - p.fees_usd for p in self.positions.values())
         return self.acct.equity_usd + self.realized_usd + unreal
+
+    def gross_notional(self, marks: dict) -> float:
+        return sum(p.size * marks.get(p.coin, p.entry_px) for p in self.positions.values())
+
+    def drawdown(self) -> float:
+        return 1.0 - self.last_equity / self.peak_equity if self.peak_equity > 0 else 0.0
+
+    def throttle(self) -> float:
+        return self.risk.drawdown_throttle(self.drawdown())
 
     # ── lifecycle ──
     def register(self, coin: str, direction: int, fill_px: float, size: float, atr: float, t_ms: int, entry_bar: int,
@@ -204,9 +222,10 @@ class PositionBook:
                 pass
         return self._close(pos, exit_px, t_ms, reason + (" (fills)" if fees is not None else " (assumed stop)"), fees)
 
-    async def _flatten(self, pos: Position, mark: float, t_ms: int) -> Optional[dict]:
+    async def _flatten(self, pos: Position, mark: float, t_ms: int, reason: str = "breaker") -> Optional[dict]:
+        """Reduce-only IOC at mark ∓ 1 % (paper: mark ∓ 5 bps). Used by the breaker and the gap-through-stop exit."""
         if not self.live:
-            return self._close(pos, self.risk.paper_exit_px(mark, pos.direction), t_ms, "breaker")
+            return self._close(pos, self.risk.paper_exit_px(mark, pos.direction), t_ms, reason)
         sd = pos.sz_decimals
         bound = round_px(mark * (1 - self.cfg.flatten_slippage), sd, "down") if pos.direction > 0 else \
             round_px(mark * (1 + self.cfg.flatten_slippage), sd, "up")
@@ -220,10 +239,42 @@ class PositionBook:
                     await self._gw(self.gateway.cancel, pos.coin, pos.stop_oid)
                 except Exception:
                     pass
-            return self._close(pos, avg, t_ms, f"breaker flatten (oid {oid})")
+            if filled < pos.size - 1e-12:
+                log.critical("%s flatten of %s partially filled %g/%g — remainder stays with its stop", reason, pos.coin, filled, pos.size)
+                pos.size -= filled
+                return None
+            return self._close(pos, avg, t_ms, f"{reason} flatten (oid {oid})")
         except Exception as e:
-            log.critical("BREAKER could not flatten %s %s: %s — stop %s stays in place", pos.side, pos.coin, e, pos.stop_oid)
+            log.critical("%s: could not flatten %s %s: %s — stop %s stays in place", reason.upper(), pos.side, pos.coin, e, pos.stop_oid)
             return None
+
+    async def _verify_stops(self, t_ms: int, skip: Optional[set] = None) -> int:
+        """Live: every resting stop must still exist on the exchange (restarts, manual cancels, HL housekeeping)."""
+        if not self.positions:
+            return 0
+        try:
+            resting = {int(o["oid"]) for o in await self.info.open_orders(self.address)}
+        except Exception as e:
+            log.warning("openOrders: %s", e)
+            return 0
+        fixed = 0
+        for pos in list(self.positions.values()):
+            if pos.stop_oid in resting or (skip and pos.coin in skip):
+                continue
+            log.critical("%s %s has no resting stop on the exchange (oid %s) — re-placing at %g", pos.side, pos.coin, pos.stop_oid, pos.stop)
+            pos.stop_oid = None
+            if await self._replace_stop(pos, pos.stop):
+                fixed += 1
+                if self.store:
+                    self.store.upsert_position(pos)
+        return fixed
+
+    def _gapped(self, pos: Position, mark: Optional[float]) -> bool:
+        """Mark already through the stop by more than the tolerance while the position is still open."""
+        if not mark or pos.stop <= 0:
+            return False
+        through = (pos.stop - mark) / pos.stop if pos.direction > 0 else (mark - pos.stop) / pos.stop
+        return through > self.cfg.stop_gap_tolerance
 
     async def _trip(self, trip: dict, marks: dict, t_ms: int) -> list:
         msg = (f"CIRCUIT BREAKER: equity ${trip['equity']:,.2f} is {trip['drawdown']:.1%} below the 24h peak "
@@ -273,6 +324,7 @@ class PositionBook:
             marks = await self.info.all_mids() if self.positions else {}
         closed: list = []
         moved = 0
+        replaced: set = set()
         for coin, pos in list(self.positions.items()):
             bars = candles.get((coin, self.tf), [])
             mark = marks.get(coin)
@@ -282,6 +334,15 @@ class PositionBook:
             if self.live and abs(acct_pos[coin]) < pos.size - 1e-9:
                 log.warning("%s size on exchange %g < book %g — partial close outside the book, size updated", coin, abs(acct_pos[coin]), pos.size)
                 pos.size = abs(acct_pos[coin])
+            if self.live and self._gapped(pos, mark):
+                # the stop-market should have fired; price gapped through it (cascade wick) or the trigger never
+                # executed within its 5 % bound — do not wait for it, take the exit at market now
+                log.critical("%s %s: mark %g is through the stop %g with the position still open — emergency exit",
+                             pos.side, coin, mark, pos.stop)
+                tr = await self._flatten(pos, mark, t_ms, "stop gapped")
+                if tr:
+                    closed.append(tr)
+                    continue
             old_stop = pos.stop
             trade = self._advance(pos, bars, mark, t_ms)
             if trade:
@@ -292,25 +353,35 @@ class PositionBook:
                 pos.stop = old_stop                      # only adopt the new level once the exchange holds it
                 if await self._replace_stop(pos, new):
                     moved += 1
+                    replaced.add(coin)
             elif not self.live and pos.stop != old_stop:
                 moved += 1
             if pos.stop != old_stop:
                 self._event(pos, "stop_move", mark or pos.best_px, f"{old_stop:g} → {pos.stop:g} (stage {pos.stage})", t_ms)
             if self.store:
                 self.store.upsert_position(pos)
+        if self.live and self.positions and t_ms - self._last_verify_ms >= self.cfg.verify_stops_s * 1000:
+            self._last_verify_ms = t_ms
+            moved += await self._verify_stops(t_ms, replaced)     # a stop placed this cycle needs no snapshot check
         if not self.live:
             equity = self.equity_dry(marks)
         trip = self.breaker.sample(t_ms, equity)
         if trip:
             closed.extend(await self._trip(trip, marks, t_ms))
         self.last_equity = equity
+        self.peak_equity = max(self.peak_equity, equity)
+        if self.store:
+            self.store.write_equity(t_ms, self.mode, equity)
         return {"equity": equity, "open": len(self.positions), "closed": closed, "stops_moved": moved,
-                "drawdown": self.breaker.drawdown(equity), "halted": self.breaker.halted(t_ms), "tripped": bool(trip)}
+                "drawdown": self.breaker.drawdown(equity), "halted": self.breaker.halted(t_ms), "tripped": bool(trip),
+                "throttle": self.throttle()}
 
 
 def format_book(summary: dict, mode: str) -> str:
     s = summary
-    txt = f"book[{mode}] equity ${s['equity']:,.2f} dd {s['drawdown']:.1%} open {s['open']} stops moved {s['stops_moved']}"
+    txt = f"book[{mode}] equity ${s['equity']:,.2f} dd24h {s['drawdown']:.1%} open {s['open']} stops moved {s['stops_moved']}"
+    if s.get("throttle", 1.0) < 1.0:
+        txt += f" · risk throttle ×{s['throttle']:.2f}"
     if s["closed"]:
         txt += " · closed " + ", ".join(f"{t['coin']} {t['r_multiple']:+.2f}R" for t in s["closed"])
     if s["halted"]:

@@ -9,7 +9,7 @@ python3 -c "import aiohttp, numpy, dotenv, pytest, hyperliquid, eth_account" 2>/
 mkdir -p state
 [ -f .env ] || { cp env.sample .env; echo "!! created $D/.env from sample — optional: TELEGRAM_* for alerts; HL_* only for --live"; }
 chmod 600 .env
-python3 -m py_compile squeeze_scanner.py convex_engine.py risk_manager.py portfolio.py wfo.py && echo "compile OK"
+python3 -m py_compile squeeze_scanner.py convex_engine.py risk_manager.py portfolio.py wfo.py stress_test.py && echo "compile OK"
 python3 -m pytest -q -p no:cacheprovider tests && echo "offline tests OK"
 cp deploy/s38-squeeze.service deploy/s38-wfo.service deploy/s38-wfo.timer /etc/systemd/system/
 systemctl daemon-reload

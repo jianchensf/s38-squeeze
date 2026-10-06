@@ -109,8 +109,8 @@ class EngineConfig:
 class AccountConfig:
     equity_usd: float = 5_000.0
     risk_pct: float = 0.01         # risk per trade as a fraction of equity
-    max_leverage: float = 5.0      # notional cap = equity × max_leverage
-    max_vlm_frac: float = 0.0005   # notional cap = 24h notional volume × this (capacity constraint)
+    max_leverage: float = 3.0      # PORTFOLIO gross notional cap = equity × max_leverage (all open positions together)
+    max_vlm_frac: float = 0.0005   # per-position notional cap = 24h notional volume × this (capacity constraint)
     min_notional_usd: float = 10.0 # HL minimum order size
     long_only: bool = False        # --long-only restricts intents and convex signals to UP breakouts
 
@@ -950,6 +950,7 @@ class Store:
         ts INTEGER PRIMARY KEY, window_start INTEGER, window_end INTEGER, split_ms INTEGER, n_coins INTEGER,
         chosen_donchian INTEGER, chosen_trail REAL, adopted INTEGER, verdict TEXT, detail TEXT);
     CREATE TABLE IF NOT EXISTS candles (coin TEXT, t INTEGER, o REAL, h REAL, l REAL, c REAL, v REAL, PRIMARY KEY (coin, t));
+    CREATE TABLE IF NOT EXISTS equity_curve (ts INTEGER, mode TEXT, equity REAL, PRIMARY KEY (ts, mode));
     """
 
     MIGRATIONS = (
@@ -1136,6 +1137,20 @@ class Store:
         row = self.con.execute("SELECT ts, halt_until_ms, (SELECT COUNT(*) FROM breaker) FROM breaker ORDER BY ts DESC LIMIT 1").fetchone()
         return BreakerState(halt_until_ms=int(row[1]), tripped_ms=int(row[0]), trips=int(row[2])) if row else BreakerState()
 
+    def write_equity(self, ts: int, mode: str, equity: float) -> None:
+        self.con.execute("INSERT OR REPLACE INTO equity_curve VALUES (?,?,?)", (ts, mode, equity))
+        self.con.commit()
+
+    def equity_samples(self, mode: str, since_ms: int) -> list:
+        return self.con.execute("SELECT ts, equity FROM equity_curve WHERE mode=? AND ts>=? ORDER BY ts", (mode, since_ms)).fetchall()
+
+    def equity_peak(self, mode: str, since_ms: int) -> float:
+        row = self.con.execute("SELECT MAX(equity) FROM equity_curve WHERE mode=? AND ts>=?", (mode, since_ms)).fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
+    def last_close_times(self, mode: str) -> dict:
+        return {coin: int(ts) for coin, ts in self.con.execute("SELECT coin, MAX(closed_ms) FROM trades WHERE mode=? GROUP BY coin", (mode,))}
+
     def close(self) -> None:
         self.con.close()
 
@@ -1211,7 +1226,13 @@ class Scanner:
             est = len(keys) * HLInfoClient.WEIGHT / self.client.limiter.rate
             log.info("cold start: loading %d candle series (~%.0fs at %d weight/min)", len(keys), est,
                      int(self.client.limiter.rate * 60))
+        t_fetch = time.monotonic()
         results = await asyncio.gather(*(self.cache.get(c, tf, t_ms) for c, tf in keys), return_exceptions=True)
+        fetch_s = time.monotonic() - t_fetch
+        if fetch_s > 600:
+            log.warning("candle refresh took %.0fs — breakout bars older than 15 min are refused as stale; the IP budget "
+                        "(%.0f/min after %d×429) is too small for this universe on this box", fetch_s,
+                        self.client.limiter.rate * 60, self.client.limiter.n_429)
         candles: dict = {}
         for key, res in zip(keys, results):
             if isinstance(res, BaseException):
@@ -1279,7 +1300,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--coins", default="", help="debug: restrict to these coins (comma-separated)")
     p.add_argument("--equity", type=float, default=5000.0, help="account equity for sizing (dry mode; live reads the account)")
     p.add_argument("--risk-pct", type=float, default=1.0, help="bootstrap risk per trade (%% of equity) until 20 realized trades exist")
-    p.add_argument("--max-risk-pct", type=float, default=4.0, help="cap on quarter-Kelly risk per trade (%% of equity)")
+    p.add_argument("--max-risk-pct", type=float, default=2.0, help="cap on quarter-Kelly risk per trade (%% of equity); 4%% means a 7-loss streak is −25%%")
     p.add_argument("--long-only", action="store_true", help="UP breakouts only (default: both sides)")
     p.add_argument("--weight", type=int, default=600, help="HL weight budget per minute (IP limit is 1200)")
     p.add_argument("--base-url", default="https://api.hyperliquid.xyz")
