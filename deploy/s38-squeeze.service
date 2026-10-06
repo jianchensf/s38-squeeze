@@ -1,15 +1,19 @@
 # hospitality1 unit (same layout as s35-pullback: code in /home/dev, runs as root under systemd).
 # Install with deploy/install_on_box.sh. Logs: journalctl -u s38-squeeze -f
-# --weight 400 leaves two thirds of HL's 1200/min per-IP budget to the live s16 book on this box. Do not raise it.
+# --weight 300 is the CEILING of this scanner's share of HL's 1200/min per-IP budget; the live s16 book on this box
+# already consumes most of it (first run 2026-10-06: 429 on the very first call). The limiter halves itself on every
+# 429 and recovers over 10 min, so the ceiling only matters when the IP is quiet. Do not raise it.
+# --convex runs the breakout engine in DRY mode (signals + would-be orders into state/s38.db, nothing sent).
+# Going live is a deliberate edit: add --live here AND put HL_API_WALLET_KEY / HL_ACCOUNT_ADDRESS in .env.
 [Unit]
-Description=s38-squeeze — Hyperliquid BB/KC squeeze + funding-fuel scanner (read-only, no orders)
+Description=s38-squeeze — Hyperliquid BB/KC squeeze + funding-fuel scanner + convex breakout engine (dry-run)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/home/dev/s38-squeeze
-ExecStart=/usr/bin/python3 /home/dev/s38-squeeze/squeeze_scanner.py --interval 60 --weight 400 --quiet
+ExecStart=/usr/bin/python3 /home/dev/s38-squeeze/squeeze_scanner.py --interval 60 --weight 300 --quiet --convex --equity 1000
 EnvironmentFile=-/home/dev/s38-squeeze/.env
 Environment=PYTHONUNBUFFERED=1
 Restart=always

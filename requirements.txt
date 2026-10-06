@@ -1,5 +1,8 @@
 aiohttp>=3.9
 numpy>=1.24
 python-dotenv>=1.0
+# live execution only (convex_engine.HLGateway); the scanner and dry-run work without it
+hyperliquid-python-sdk>=0.9
+eth-account>=0.10
 # tests
 pytest>=7

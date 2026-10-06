@@ -5,9 +5,10 @@ import time
 import aiohttp
 from aiohttp.test_utils import TestServer
 
+from convex_engine import BreakoutConfig, ConvexExecutor, ConvexRunner, ConvexSignalEngine, ExecConfig, OIHistory
 from squeeze_scanner import (
     ARMED, COOLDOWN, IDLE, AssetCtx, CandleCache, FundingTracker, HLInfoClient, Scanner, StateEngine, Store,
-    WeightLimiter, build_configs, filter_universe, last_closed_open_time, main, parse_args,
+    WeightLimiter, build_configs, filter_universe, last_closed_open_time, main, now_ms, parse_args,
 )
 from synth import UNIVERSE, make_app
 
@@ -24,7 +25,7 @@ def test_universe_filter_reasons():
     assets = [AssetCtx.from_api(m, c) for m, c in UNIVERSE]
     ucfg = build_configs(parse_args(["--once"]))[0]
     eligible, reasons = filter_universe(assets, ucfg)
-    assert [a.coin for a in eligible] == ["AAA", "BBB", "GGG"]
+    assert [a.coin for a in eligible] == ["AAA", "BBB", "GGG", "KKK"]
     assert reasons == {"BTC": "excluded", "ETH": "excluded", "SOL": "excluded", "CCC": "vol_low", "DDD": "vol_high",
                        "EEE": "delisted", "FFF": "spread_wide", "HHH": "no_mid"}
     aaa = next(a for a in assets if a.coin == "AAA")
@@ -32,15 +33,50 @@ def test_universe_filter_reasons():
     assert abs(aaa.day_change - (100.3 / 95 - 1)) < 1e-9
 
 
-def test_weight_limiter_paces():
+def test_weight_limiter_paces_and_adapts():
     async def go():
-        lim = WeightLimiter(6000)        # 100 weight/s
-        await lim.acquire(6000)          # drain the bucket
+        lim = WeightLimiter(6000)                   # 100 weight/s ceiling, burst of two calls, no more
         t0 = time.monotonic()
-        await lim.acquire(20)            # needs 0.2s of refill
-        return time.monotonic() - t0
-    waited = asyncio.run(go())
-    assert 0.15 <= waited < 1.5
+        await lim.acquire(20)
+        await lim.acquire(20)
+        burst = time.monotonic() - t0
+        t1 = time.monotonic()
+        await lim.acquire(20)                       # third call needs 0.2s of refill
+        paced = time.monotonic() - t1
+        new_budget = lim.penalize(debt_s=0.2)       # 429: rate halves to 50/s and 0.2s of debt is owed
+        t2 = time.monotonic()
+        await lim.acquire(20)                       # debt 0.2s + 20/50 = 0.6s
+        after_429 = time.monotonic() - t2
+        lim._last_429 -= 120                        # pretend: 2 min since the 429, 5 min since the last refill
+        lim._updated -= 300
+        lim._refill(time.monotonic())
+        return burst, paced, new_budget, after_429, lim.rate, lim.n_429
+    burst, paced, new_budget, after_429, rate, n = asyncio.run(go())
+    assert burst < 0.05 and 0.15 <= paced < 1.0
+    assert new_budget == 3000 and 0.5 <= after_429 < 2.0 and n == 1
+    assert rate == 100.0                            # recovered to the ceiling: 50 + 100 × 300/600
+
+
+def test_client_survives_429_and_backs_off():
+    async def go():
+        app, calls = make_app(fail_429_first=2)
+        async with TestServer(app) as server:
+            base = f"http://{server.host}:{server.port}"
+            args = parse_args(["--once", "--db", "", "--base-url", base, "--weight", "600000", "--quiet"])
+            ucfg, scfg, fcfg, ecfg, acct, ccfg = build_configs(args)
+            ccfg = type(ccfg)(**{**ccfg.__dict__, "penalty_s": 0.1})
+            async with aiohttp.ClientSession() as session:
+                lim = WeightLimiter(ccfg.weight_per_minute)
+                client = HLInfoClient(ccfg, session, lim)
+                scanner = Scanner(client, CandleCache(client, scfg), FundingTracker(client), StateEngine(ecfg, acct, []),
+                                  None, ucfg, scfg, fcfg, quiet=True)
+                rows = await scanner.cycle()
+                return rows, dict(calls), lim.n_429, lim.rate, lim.max_rate
+    rows, calls, n429, rate, max_rate = asyncio.run(go())
+    assert calls["429"] == 2 and n429 == 2
+    assert calls["candleSnapshot"] == 8 + 2                 # every series still loaded, two retries
+    assert {r.ctx.coin for r in rows} == {"AAA", "BBB", "GGG", "KKK"}
+    assert rate == max_rate / 4                             # halved twice, no recovery yet
 
 
 def test_end_to_end_pipeline(tmp_path, capsys):
@@ -59,7 +95,16 @@ def test_end_to_end_pipeline(tmp_path, capsys):
                 client = HLInfoClient(ccfg, session, WeightLimiter(ccfg.weight_per_minute))
                 engine = StateEngine(ecfg, acct, [cap, store], fuel_tf=fcfg.fuel_tf)
                 cache = CandleCache(client, scfg)
-                scanner = Scanner(client, cache, FundingTracker(client, store), engine, store, ucfg, scfg, fcfg, quiet=True)
+                # convex engine in dry mode, with the OI sample at the breakout bar's open pre-seeded (1000 → ctx 1040)
+                oi = OIHistory()
+                oi.record("KKK", last_closed_open_time("1h", now_ms()) + 30_000, 1000.0)
+                oi.record("GGG", last_closed_open_time("1h", now_ms()) + 30_000, 900.0)
+                # the synthetic bars are anchored to the wall clock, so relax the freshness guard here
+                # (it is unit-tested in test_convex); everything else runs with production defaults
+                runner = ConvexRunner(ConvexSignalEngine(BreakoutConfig(max_signal_age_s=4000), oi, store),
+                                      ConvexExecutor(ExecConfig(live=False), acct, client, store))
+                scanner = Scanner(client, cache, FundingTracker(client, store), engine, store, ucfg, scfg, fcfg,
+                                  quiet=True, hooks=[runner.on_cycle])
                 rows1 = await scanner.cycle()
                 calls1 = dict(calls)
                 rows2 = await scanner.cycle()
@@ -67,14 +112,19 @@ def test_end_to_end_pipeline(tmp_path, capsys):
             restored = StateEngine(ecfg, acct, [], restore_fires=store.last_fire_bars())
             n_scans = store.con.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
             n_fund = store.con.execute("SELECT COUNT(*) FROM funding_hourly WHERE coin='AAA'").fetchone()[0]
-            fires = store.con.execute("SELECT coin, direction, intent FROM events WHERE kind='FIRE'").fetchall()
+            fires = store.con.execute("SELECT coin, direction, intent FROM events WHERE kind='FIRE' AND coin='GGG'").fetchall()
+            sigs = store.con.execute("SELECT coin, side, accepted, reasons, oi_change FROM signals ORDER BY coin").fetchall()
+            orders = store.con.execute("SELECT coin, side, mode, status, sz, notional, stop_px FROM orders").fetchall()
+            oi_rows = store.con.execute("SELECT COUNT(*) FROM scans WHERE oi IS NOT NULL").fetchone()[0]
             store.close()
-            return rows1, rows2, calls1, calls2, cap.events, engine, cache, restored, n_scans, n_fund, fires
+            return (rows1, rows2, calls1, calls2, cap.events, engine, cache, restored, n_scans, n_fund, fires,
+                    sigs, orders, oi_rows, runner)
 
-    rows1, rows2, calls1, calls2, events, engine, cache, restored, n_scans, n_fund, fires = asyncio.run(go())
+    (rows1, rows2, calls1, calls2, events, engine, cache, restored, n_scans, n_fund, fires,
+     sigs, orders, oi_rows, runner) = asyncio.run(go())
 
     # universe → rows
-    assert {r.ctx.coin for r in rows1} == {"AAA", "BBB", "GGG"}
+    assert {r.ctx.coin for r in rows1} == {"AAA", "BBB", "GGG", "KKK"}
     assert rows1[0].ctx.coin in {"AAA", "GGG"}  # squeezed names rank above the trend name
     by = {r.ctx.coin: r for r in rows1}
     assert by["AAA"].squeeze["1h"].squeeze_on and by["AAA"].squeeze["4h"].squeeze_on
@@ -91,7 +141,7 @@ def test_end_to_end_pipeline(tmp_path, capsys):
     kinds = [(e.coin, e.kind) for e in events]
     assert ("AAA", "ARM") in kinds and ("GGG", "FIRE") in kinds
     assert kinds.count(("GGG", "FIRE")) == 1          # second cycle must not re-fire the same bar
-    fire = next(e for e in events if e.kind == "FIRE")
+    fire = next(e for e in events if e.kind == "FIRE" and e.coin == "GGG")
     assert fire.direction == 1 and fire.intent is not None
     i = fire.intent
     assert i.side == "long" and i.entry_px == 110.0 and i.stop_px < i.entry_px
@@ -102,19 +152,32 @@ def test_end_to_end_pipeline(tmp_path, capsys):
     # cache: the open bar is dropped, and nothing was re-fetched on the second cycle
     bars = cache._bars[("GGG", "1h")]
     assert bars[-1].t == last_closed_open_time("1h", rows1[0].ts)
-    assert calls1["candleSnapshot"] == 6 and calls2["candleSnapshot"] == 6
+    assert calls1["candleSnapshot"] == 8 and calls2["candleSnapshot"] == 8
     assert calls2["metaAndAssetCtxs"] == 2
     assert calls1["fundingHistory"] >= 1 and calls2["fundingHistory"] == calls1["fundingHistory"]
 
+    # convex engine: KKK has squeeze + Donchian break + volume spike + OI +4% → one dry order;
+    # GGG breaks out on flat volume → rejected; the same bars are not re-evaluated on cycle 2
+    assert calls1["allMids"] == 1 and calls2["allMids"] == 1
+    assert [(c, s, ok) for c, s, ok, _, _ in sigs] == [("GGG", "long", 0), ("KKK", "long", 1)]
+    assert "vol_z=nan" in sigs[0][3] and abs(sigs[1][4] - 0.04) < 1e-9
+    assert len(orders) == 1
+    coin, side, mode, status, sz, notional, stop_px = orders[0]
+    assert (coin, side, mode, status) == ("KKK", "long", "dry", "dry")
+    assert sz > 0 and abs(notional - sz * 110.0) < 1e-6 and stop_px == 99.5          # breakout bar low
+    assert runner.executor._dry_positions == {"KKK": rows1[0].ts}
+
     # persistence + restore
-    assert n_scans == 6 and n_fund >= 24
+    assert n_scans == 8 and n_fund >= 24 and oi_rows == 8
     assert len(fires) == 1 and fires[0][0] == "GGG" and fires[0][1] == 1 and '"side": "long"' in fires[0][2]
     assert restored.states["GGG"].state == COOLDOWN
     assert os.path.exists(db)
 
-    # db viewers used by `make events` / `make scans`
+    # db viewers used by `make events` / `make scans` / `make signals` / `make orders`
     assert main(["--db", db, "--events", "10"]) == 0
     assert main(["--db", db, "--scans"]) == 0
+    assert main(["--db", db, "--signals", "--orders"]) == 0
     out = capsys.readouterr().out
     assert "FIRE" in out and "GGG" in out and "AAA" in out and "ARMED" in out
+    assert "vol_z=nan" in out and "KKK" in out and " dry " in out
     assert main(["--db", str(tmp_path / "missing.db"), "--scans"]) == 1

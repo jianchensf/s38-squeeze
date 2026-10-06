@@ -61,11 +61,12 @@ def utc(ms: int) -> str:
 class ClientConfig:
     base_url: str = "https://api.hyperliquid.xyz"
     # HL allows 1200 weight/min per IP. Every info call used here costs 20.
-    # Default to half the budget so other processes on the same IP keep working.
+    # Default to half the budget so other processes on the same IP keep working; the limiter adapts down on 429.
     weight_per_minute: int = 600
-    max_concurrency: int = 3
+    max_concurrency: int = 2
     timeout_s: float = 15.0
     max_retries: int = 4
+    penalty_s: float = 30.0      # silence owed after a 429 (the shared IP is saturated)
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,7 @@ class AccountConfig:
     max_leverage: float = 5.0      # notional cap = equity × max_leverage
     max_vlm_frac: float = 0.0005   # notional cap = 24h notional volume × this (capacity constraint)
     min_notional_usd: float = 10.0 # HL minimum order size
-    long_only: bool = True
+    long_only: bool = False        # --long-only restricts intents and convex signals to UP breakouts
 
 
 # ───────────────────────────────── types ──────────────────────────────────
@@ -222,6 +223,8 @@ class SqueezeMetrics:
     squeeze_on: bool         # both Bollinger bands strictly inside the Keltner channel
     squeeze_bars: int        # consecutive closed bars with squeeze_on, ending at the last bar
     prev_squeeze_bars: int   # same, ending at the bar before last (length of a squeeze that just released)
+    bars_since_squeeze: int  # 0 = on now, 1 = on at bar[-2], …; −1 = never within the loaded history
+    last_squeeze_run: int    # length of the most recent squeeze run (the one that ended bars_since_squeeze ago)
     released: bool           # squeeze_on at bar[-2] and not at bar[-1]
     release_dir: int         # +1 / −1 (TTM momentum sign) when released, else 0
     bbw_pctile: float        # fraction of lookback bars with BB width ≤ current (0 = tightest ever)
@@ -295,25 +298,51 @@ class HLError(RuntimeError):
 
 
 class WeightLimiter:
-    """Token bucket over Hyperliquid's per-IP weight budget. FIFO, lock-serialised."""
+    """Adaptive token bucket over Hyperliquid's per-IP weight budget (1200/min, shared by every process on the IP).
 
-    def __init__(self, weight_per_minute: int):
-        self.capacity = float(weight_per_minute)
-        self.tokens = float(weight_per_minute)
-        self.rate = weight_per_minute / 60.0
+    - no start-up burst: capacity is two calls, so a cold start is paced from the first second
+    - on HTTP 429 (`penalize`): rate halves (floor 10 % of the configured budget) and the bucket goes into debt
+      for `debt_s` seconds — a 429 means the whole IP is saturated, which also hurts any live bot behind it
+    - after 60 s without a 429 the rate recovers linearly to the configured budget over `recovery_s`
+    FIFO, lock-serialised."""
+
+    def __init__(self, weight_per_minute: int, burst_calls: int = 2, call_weight: int = 20,
+                 floor_frac: float = 0.1, recovery_s: float = 600.0):
+        self.max_rate = weight_per_minute / 60.0
+        self.rate = self.max_rate
+        self.floor = self.max_rate * floor_frac
+        self.capacity = float(burst_calls * call_weight)
+        self.tokens = self.capacity
+        self.recovery_s = recovery_s
+        self.n_429 = 0
         self._updated = time.monotonic()
+        self._last_429 = -1e9
         self._lock = asyncio.Lock()
+
+    def _refill(self, now: float) -> None:
+        dt = max(0.0, now - self._updated)
+        self._updated = now
+        if self.rate < self.max_rate and now - self._last_429 > 60.0:
+            self.rate = min(self.max_rate, self.rate + self.max_rate * dt / self.recovery_s)
+        self.tokens = min(self.capacity, self.tokens + dt * self.rate)
 
     async def acquire(self, weight: int) -> None:
         async with self._lock:
             while True:
-                now = time.monotonic()
-                self.tokens = min(self.capacity, self.tokens + (now - self._updated) * self.rate)
-                self._updated = now
+                self._refill(time.monotonic())
                 if self.tokens >= weight:
                     self.tokens -= weight
                     return
                 await asyncio.sleep((weight - self.tokens) / self.rate)
+
+    def penalize(self, debt_s: float = 30.0) -> float:
+        """Record a 429: halve the rate and owe `debt_s` seconds of silence. Returns the new budget in weight/min."""
+        self._refill(time.monotonic())
+        self.rate = max(self.floor, self.rate / 2.0)
+        self.tokens = min(self.tokens, -self.rate * debt_s)
+        self._last_429 = self._updated
+        self.n_429 += 1
+        return self.rate * 60.0
 
 
 class HLInfoClient:
@@ -328,19 +357,25 @@ class HLInfoClient:
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
         self.calls = Counter()
 
-    async def _post(self, body: dict) -> Any:
+    async def _post(self, body: dict, weight: int = WEIGHT) -> Any:
         url = f"{self.cfg.base_url}/info"
         kind = body.get("type", "?")
         last_err: Optional[BaseException] = None
         for attempt in range(self.cfg.max_retries + 1):
-            await self.limiter.acquire(self.WEIGHT)
+            await self.limiter.acquire(weight)
             self.calls[kind] += 1
             try:
                 async with self._sem:
                     async with self.session.post(
                         url, json=body, timeout=aiohttp.ClientTimeout(total=self.cfg.timeout_s)
                     ) as r:
-                        if r.status == 429 or r.status >= 500:
+                        if r.status == 429:
+                            last_err = HLError(f"HTTP 429 for {kind}")
+                            budget = self.limiter.penalize(self.cfg.penalty_s)
+                            log.warning("HTTP 429 for %s — IP budget saturated; scanner budget cut to %.0f weight/min, "
+                                        "pausing %.0fs (attempt %d)", kind, budget, self.cfg.penalty_s, attempt + 1)
+                            continue                      # the limiter's debt paces the retry
+                        if r.status >= 500:
                             last_err = HLError(f"HTTP {r.status} for {kind}")
                             log.warning("%s (attempt %d)", last_err, attempt + 1)
                         elif r.status >= 400:
@@ -381,6 +416,20 @@ class HLInfoClient:
         pts = [FundingPoint(int(d["time"]), float(d["fundingRate"]), float(d.get("premium") or 0.0)) for d in data]
         pts.sort(key=lambda p: p.time)
         return pts
+
+    async def all_mids(self) -> dict:
+        """coin -> mid price. Weight 2."""
+        data = await self._post({"type": "allMids"}, weight=2)
+        if not isinstance(data, dict):
+            raise HLError("unexpected allMids payload")
+        return {k: float(v) for k, v in data.items() if _f(v) is not None}
+
+    async def user_state(self, address: str) -> dict:
+        """clearinghouseState for an account / sub-account address. Weight 2."""
+        data = await self._post({"type": "clearinghouseState", "user": address}, weight=2)
+        if not isinstance(data, dict) or "marginSummary" not in data:
+            raise HLError("unexpected clearinghouseState payload")
+        return data
 
 
 # ───────────────────────────── universe filter ────────────────────────────
@@ -545,6 +594,10 @@ def compute_squeeze(tf: str, candles: Sequence[Candle], cfg: SqueezeConfig,
     bars = _run_length(on, i)
     prev_bars = _run_length(on, i - 1)
     released = bool(on[i - 1] and not on[i])
+    j = i
+    while j >= 0 and not on[j]:
+        j -= 1
+    since, last_run = (i - j, _run_length(on, j)) if j >= 0 else (-1, 0)
 
     hh_n, ll_n = rolling_max(h, n)[i], rolling_min(l, n)[i]
     # TTM / LazyBear momentum proxy: close vs midpoint of (Donchian mid, SMA)
@@ -563,8 +616,8 @@ def compute_squeeze(tf: str, candles: Sequence[Candle], cfg: SqueezeConfig,
         bb_basis=float(basis[i]), bb_upper=float(bb_u[i]), bb_lower=float(bb_l[i]),
         kc_basis=float(kc_mid[i]), kc_upper=float(kc_u[i]), kc_lower=float(kc_l[i]), atr=float(atr[i]),
         bb_width=float(bbw[i]), squeeze_ratio=float(ratio[i]), squeeze_on=bool(on[i]),
-        squeeze_bars=bars, prev_squeeze_bars=prev_bars, released=released, release_dir=release_dir,
-        bbw_pctile=pct, range_pos=range_pos, n_bars=len(candles),
+        squeeze_bars=bars, prev_squeeze_bars=prev_bars, bars_since_squeeze=since, last_squeeze_run=last_run,
+        released=released, release_dir=release_dir, bbw_pctile=pct, range_pos=range_pos, n_bars=len(candles),
     )
 
 
@@ -799,9 +852,10 @@ class TelegramSink:
         self.session, self.token, self.chat_id, self.kinds = session, token, chat_id, set(kinds)
 
     async def on_event(self, ev: SignalEvent) -> None:
-        if ev.kind not in self.kinds:
-            return
-        text = f"s38-squeeze {utc(ev.ts)}\n" + format_event(ev).replace(" | ", "\n")
+        if ev.kind in self.kinds:
+            await self.send(f"s38-squeeze {utc(ev.ts)}\n" + format_event(ev).replace(" | ", "\n"))
+
+    async def send(self, text: str) -> None:
         try:
             async with self.session.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
                                          json={"chat_id": self.chat_id, "text": text},
@@ -821,7 +875,7 @@ class Store:
         funding REAL, oi_notional REAL, day_ntl_vlm REAL, spread_bps REAL,
         sq1h_on INTEGER, sq1h_ratio REAL, sq1h_bbw REAL, sq1h_pct REAL, sq1h_bars INTEGER, sq1h_range_pos REAL, sq1h_bar_time INTEGER,
         sq4h_on INTEGER, sq4h_ratio REAL, sq4h_bbw REAL, sq4h_pct REAL, sq4h_bars INTEGER, sq4h_range_pos REAL, sq4h_bar_time INTEGER,
-        fuel INTEGER, near_zero INTEGER, neg_hours_24h INTEGER, funding_24h_mean REAL,
+        fuel INTEGER, near_zero INTEGER, neg_hours_24h INTEGER, funding_24h_mean REAL, oi REAL,
         PRIMARY KEY (ts, coin));
     CREATE TABLE IF NOT EXISTS events (
         ts INTEGER, coin TEXT, kind TEXT, state_from TEXT, state_to TEXT, direction INTEGER,
@@ -829,6 +883,15 @@ class Store:
     CREATE INDEX IF NOT EXISTS events_coin_kind ON events (coin, kind, bar_time);
     CREATE TABLE IF NOT EXISTS funding_hourly (coin TEXT, time INTEGER, rate REAL, premium REAL, PRIMARY KEY (coin, time));
     CREATE TABLE IF NOT EXISTS universe (ts INTEGER PRIMARY KEY, n_total INTEGER, n_eligible INTEGER, reasons TEXT);
+    CREATE TABLE IF NOT EXISTS signals (
+        ts INTEGER, coin TEXT, side TEXT, bar_time INTEGER, ref_px REAL, close REAL, high REAL, low REAL,
+        donchian_upper REAL, donchian_lower REAL, vol_z REAL, oi_open REAL, oi_close REAL, oi_change REAL,
+        squeeze_run INTEGER, bars_since_squeeze INTEGER, atr REAL, stop_px REAL, accepted INTEGER, reasons TEXT,
+        PRIMARY KEY (coin, bar_time));
+    CREATE TABLE IF NOT EXISTS orders (
+        ts INTEGER, coin TEXT, side TEXT, mode TEXT, status TEXT, sz REAL, bound_px REAL, ref_px REAL,
+        filled_sz REAL, avg_px REAL, slippage_bps REAL, notional REAL, stop_px REAL, oid INTEGER, stop_oid INTEGER,
+        error TEXT, raw TEXT);
     """
 
     def __init__(self, path: str):
@@ -836,6 +899,13 @@ class Store:
         self.con = sqlite3.connect(path)
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.executescript(self.SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {r[1] for r in self.con.execute("PRAGMA table_info(scans)")}
+        if "oi" not in cols:                       # v1 databases: OI in coin units was added for the convex engine
+            self.con.execute("ALTER TABLE scans ADD COLUMN oi REAL")
+            self.con.commit()
 
     def last_fire_bars(self) -> dict:
         cur = self.con.execute("SELECT coin, MAX(bar_time) FROM events WHERE kind='FIRE' GROUP BY coin")
@@ -862,14 +932,37 @@ class Store:
             recs.append((r.ts, c.coin, st.state if st else None, r.score, c.mark_px, c.mid_px, c.day_change,
                          c.funding, c.oi_notional, c.day_ntl_vlm, c.impact_spread_bps,
                          *tfcols(r.squeeze.get("1h")), *tfcols(r.squeeze.get("4h")),
-                         int(f.short_squeeze_fuel), int(f.near_zero), f.neg_hours_24h, f.funding_24h_mean))
-        self.con.executemany(f"INSERT OR REPLACE INTO scans VALUES ({','.join('?' * 29)})", recs)
+                         int(f.short_squeeze_fuel), int(f.near_zero), f.neg_hours_24h, f.funding_24h_mean,
+                         c.open_interest))
+        self.con.executemany(f"INSERT OR REPLACE INTO scans VALUES ({','.join('?' * 30)})", recs)
         self.con.commit()
 
     async def on_event(self, ev: SignalEvent) -> None:
         self.con.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?)",
                          (ev.ts, ev.coin, ev.kind, ev.state_from, ev.state_to, ev.direction, ev.bar_time,
                           ev.mark_px, ev.note, json.dumps(asdict(ev.intent)) if ev.intent else None))
+        self.con.commit()
+
+    # ── convex engine ──
+    def oi_history(self, since_ms: int) -> list:
+        return self.con.execute("SELECT ts, coin, oi FROM scans WHERE ts >= ? AND oi IS NOT NULL", (since_ms,)).fetchall()
+
+    def signal_keys(self) -> list:
+        return [(c, int(b)) for c, b in self.con.execute("SELECT coin, bar_time FROM signals").fetchall()]
+
+    def write_signal(self, s: Any, accepted: bool, reasons: Sequence[str]) -> None:
+        self.con.execute(
+            f"INSERT OR REPLACE INTO signals VALUES ({','.join('?' * 20)})",
+            (s.ts, s.coin, s.side, s.bar_time, s.ref_px, s.close, s.high, s.low, s.donchian_upper, s.donchian_lower,
+             s.vol_z, s.oi_open, s.oi_close, s.oi_change, s.squeeze_run, s.bars_since_squeeze, s.atr, s.stop_px,
+             int(accepted), "; ".join(reasons)))
+        self.con.commit()
+
+    def write_order(self, r: Any) -> None:
+        self.con.execute(
+            f"INSERT INTO orders VALUES ({','.join('?' * 17)})",
+            (r.ts, r.coin, r.side, r.mode, r.status, r.sz, r.bound_px, r.ref_px, r.filled_sz, r.avg_px,
+             r.slippage_bps, r.notional, r.stop_px, r.oid, r.stop_oid, r.error, r.raw))
         self.con.commit()
 
     def close(self) -> None:
@@ -913,11 +1006,13 @@ def render_table(rows: Sequence[ScanRow], states: dict, top: int, t_ms: int) -> 
 class Scanner:
     def __init__(self, client: HLInfoClient, cache: CandleCache, funding: FundingTracker, engine: StateEngine,
                  store: Optional[Store], ucfg: UniverseConfig, scfg: SqueezeConfig, fcfg: FuelConfig,
-                 top: int = 25, quiet: bool = False, coins: Optional[Sequence[str]] = None):
+                 top: int = 25, quiet: bool = False, coins: Optional[Sequence[str]] = None,
+                 hooks: Optional[list] = None):
         self.client, self.cache, self.funding, self.engine, self.store = client, cache, funding, engine, store
         self.ucfg, self.scfg, self.fcfg = ucfg, scfg, fcfg
         self.top, self.quiet = top, quiet
         self.only = set(coins) if coins else None
+        self.hooks = list(hooks or [])      # async fn(rows, candles, t_ms) — e.g. ConvexRunner.on_cycle
         self.cycles = 0
 
     async def cycle(self) -> list:
@@ -972,12 +1067,18 @@ class Scanner:
         events = await self.engine.update(rows, t_ms)
         if self.store:
             self.store.write_scans(rows, self.engine.states)
+        for hook in self.hooks:
+            try:
+                await hook(rows, candles, t_ms)
+            except Exception:       # a hook must never take the scanner down
+                log.exception("hook %s failed", getattr(hook, "__qualname__", hook))
         self.cache.evict_unseen(t_ms)
         self.cycles += 1
         n_on = sum(1 for r in rows if any(m.squeeze_on for m in r.squeeze.values()))
         n_fuel = sum(1 for r in rows if r.fuel.short_squeeze_fuel)
-        log.info("cycle %d: %d rows, %d squeezed, %d with fuel, %d events, %d api calls, %.1fs",
-                 self.cycles, len(rows), n_on, n_fuel, len(events), sum(self.client.calls.values()), time.monotonic() - t0)
+        log.info("cycle %d: %d rows, %d squeezed, %d with fuel, %d events, %d api calls, %d×429, budget %.0f/min, %.1fs",
+                 self.cycles, len(rows), n_on, n_fuel, len(events), sum(self.client.calls.values()),
+                 self.client.limiter.n_429, self.client.limiter.rate * 60, time.monotonic() - t0)
         if not self.quiet:
             print(render_table(rows, self.engine.states, self.top, t_ms), flush=True)
         return rows
@@ -997,16 +1098,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-spread-bps", type=float, default=60.0)
     p.add_argument("--tfs", default="1h,4h")
     p.add_argument("--coins", default="", help="debug: restrict to these coins (comma-separated)")
-    p.add_argument("--equity", type=float, default=5000.0, help="account equity for intent sizing")
+    p.add_argument("--equity", type=float, default=5000.0, help="account equity for sizing (dry mode; live reads the account)")
     p.add_argument("--risk-pct", type=float, default=1.0, help="risk per trade, percent of equity")
-    p.add_argument("--allow-shorts", action="store_true", help="also size intents for DOWN releases")
+    p.add_argument("--long-only", action="store_true", help="UP breakouts only (default: both sides)")
     p.add_argument("--weight", type=int, default=600, help="HL weight budget per minute (IP limit is 1200)")
     p.add_argument("--base-url", default="https://api.hyperliquid.xyz")
     p.add_argument("--top", type=int, default=25)
     p.add_argument("--quiet", action="store_true", help="no table, log lines only")
     p.add_argument("--log-level", default="INFO")
-    p.add_argument("--events", type=int, nargs="?", const=30, metavar="N", help="print the last N events from --db and exit")
-    p.add_argument("--scans", action="store_true", help="print the latest scan rows from --db and exit")
+    g = p.add_argument_group("convex engine (Donchian breakout + volume z + OI inflow → IOC entry)")
+    g.add_argument("--convex", action="store_true", help="run the ConvexSignalEngine on each cycle (dry-run orders)")
+    g.add_argument("--live", action="store_true", help="send real IOC orders; needs HL_API_WALLET_KEY (+ HL_ACCOUNT_ADDRESS) in env")
+    g.add_argument("--max-positions", type=int, default=3)
+    g.add_argument("--max-slippage-bps", type=float, default=8.0, help="IOC bound off the fresh mid (default 0.08%%)")
+    v = p.add_argument_group("db views (print and exit)")
+    v.add_argument("--events", type=int, nargs="?", const=30, metavar="N", help="last N state-engine events")
+    v.add_argument("--scans", action="store_true", help="latest scan rows ranked by score")
+    v.add_argument("--signals", type=int, nargs="?", const=30, metavar="N", help="last N convex signals (accepted and rejected)")
+    v.add_argument("--orders", type=int, nargs="?", const=30, metavar="N", help="last N order reports")
     return p.parse_args(argv)
 
 
@@ -1019,6 +1128,21 @@ def show_db(path: str, what: str, n: int = 30) -> None:
         for ts, coin, kind, f, t, d, px, note in con.execute(
                 "SELECT ts, coin, kind, state_from, state_to, direction, mark_px, note FROM events ORDER BY ts DESC LIMIT ?", (n,)):
             print(f"{utc(ts):<18}{coin:<9}{kind:<13}{f:<9}{t:<9}{d:>4}{px:>11.6g}  {note}")
+    elif what == "signals":
+        print(f"{'BAR (UTC)':<18}{'COIN':<9}{'SIDE':<6}{'CLOSE':>11}{'DONCH':>11}{'VOL_Z':>7}{'OI%':>7}{'SQZ':>5}{'AGO':>4}{'STOP':>11} OK REASONS")
+        for bt, coin, side, close, du, dl, vz, oic, run, ago, stop, ok, reasons in con.execute(
+                "SELECT bar_time, coin, side, close, donchian_upper, donchian_lower, vol_z, oi_change, squeeze_run, "
+                "bars_since_squeeze, stop_px, accepted, reasons FROM signals ORDER BY bar_time DESC LIMIT ?", (n,)):
+            band = du if side == "long" else dl
+            print(f"{utc(bt):<18}{coin:<9}{side:<6}{close:>11.6g}{band:>11.6g}{g(vz, '.1f'):>7}"
+                  f"{g(oic * 100 if oic is not None else None, '+.1f'):>7}{run:>5}{ago:>4}{stop:>11.6g} {'Y' if ok else '-':>2} {reasons}")
+    elif what == "orders":
+        print(f"{'UTC':<18}{'COIN':<9}{'SIDE':<6}{'MODE':<5}{'STATUS':<9}{'SZ':>9}{'BOUND':>11}{'REF':>11}{'FILLED':>9}{'AVG':>11}{'SLIP':>6}{'STOP':>11} NOTE")
+        for ts, coin, side, mode, st, sz, bound, ref, filled, avg, slip, stop, err in con.execute(
+                "SELECT ts, coin, side, mode, status, sz, bound_px, ref_px, filled_sz, avg_px, slippage_bps, stop_px, error "
+                "FROM orders ORDER BY ts DESC LIMIT ?", (n,)):
+            print(f"{utc(ts):<18}{coin:<9}{side:<6}{mode:<5}{st:<9}{g(sz, 'g'):>9}{g(bound, '.6g'):>11}{g(ref, '.6g'):>11}"
+                  f"{g(filled, 'g'):>9}{g(avg, '.6g'):>11}{g(slip, '+.1f'):>6}{g(stop, '.6g'):>11} {err or ''}")
     else:
         row = con.execute("SELECT MAX(ts) FROM scans").fetchone()
         print(f"latest scan {utc(row[0]) if row and row[0] else '—'}")
@@ -1037,9 +1161,39 @@ def build_configs(a: argparse.Namespace) -> tuple:
     scfg = SqueezeConfig(timeframes=tuple(x.strip() for x in a.tfs.split(",") if x.strip()))
     fcfg = FuelConfig(fuel_tf=scfg.timeframes[0])
     ecfg = EngineConfig()
-    acct = AccountConfig(equity_usd=a.equity, risk_pct=a.risk_pct / 100.0, long_only=not a.allow_shorts)
+    acct = AccountConfig(equity_usd=a.equity, risk_pct=a.risk_pct / 100.0, long_only=a.long_only)
     ccfg = ClientConfig(base_url=a.base_url.rstrip("/"), weight_per_minute=a.weight)
     return ucfg, scfg, fcfg, ecfg, acct, ccfg
+
+
+def build_convex_hook(a: argparse.Namespace, acct: AccountConfig, client: HLInfoClient, store: Optional[Store],
+                      telegram: "Optional[TelegramSink]") -> Optional[Any]:
+    """ConvexSignalEngine + executor as a scanner hook. Returns None (and logs why) if live was asked for unsafely."""
+    from convex_engine import (BreakoutConfig, ConvexExecutor, ConvexRunner, ConvexSignalEngine, ExecConfig,
+                               HLGateway, OIHistory)
+    oi = OIHistory()
+    if store:
+        oi.load(store.oi_history(now_ms() - 6 * HOUR_MS))
+    bcfg = BreakoutConfig(allow_shorts=not acct.long_only)
+    xcfg = ExecConfig(live=a.live, max_slippage=a.max_slippage_bps / 1e4, max_positions=a.max_positions)
+    gateway, address = None, None
+    if a.live:
+        key = os.environ.get("HL_API_WALLET_KEY")
+        master, sub = os.environ.get("HL_ACCOUNT_ADDRESS"), os.environ.get("HL_SUBACCOUNT_ADDRESS")
+        if not key or not master:
+            log.error("--live refused: HL_API_WALLET_KEY and HL_ACCOUNT_ADDRESS must be set in the environment")
+            return None
+        gateway = HLGateway(key, master, sub, a.base_url.rstrip("/"))
+        address = sub or master
+        log.warning("LIVE EXECUTION ENABLED — trading for %s via API wallet %s · max %d positions · risk %.2f%%/trade · "
+                    "notional ≤ min(%.0fx equity, %.2f%% of 24h volume) · IOC bound %.0f bps · %s",
+                    address, gateway.signer, xcfg.max_positions, acct.risk_pct * 100, acct.max_leverage,
+                    acct.max_vlm_frac * 100, a.max_slippage_bps, "long only" if acct.long_only else "both sides")
+    else:
+        log.info("convex engine in DRY mode: signals and would-be orders are logged and stored, nothing is sent")
+    executor = ConvexExecutor(xcfg, acct, client, store, gateway, address,
+                              notify=telegram.send if telegram else None, limiter=client.limiter)
+    return ConvexRunner(ConvexSignalEngine(bcfg, oi, store), executor).on_cycle
 
 
 async def run(a: argparse.Namespace) -> None:
@@ -1050,15 +1204,24 @@ async def run(a: argparse.Namespace) -> None:
         sinks: list = [LogSink()]
         if store:
             sinks.append(store)
+        telegram: Optional[TelegramSink] = None
         tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
         if tok and chat:
-            sinks.append(TelegramSink(session, tok, chat))
-            log.info("telegram sink enabled (FIRE, ARM)")
+            telegram = TelegramSink(session, tok, chat)
+            sinks.append(telegram)
+            log.info("telegram sink enabled (FIRE, ARM, convex orders)")
         engine = StateEngine(ecfg, acct, sinks, fuel_tf=fcfg.fuel_tf,
                              restore_fires=store.last_fire_bars() if store else None)
         scanner = Scanner(client, CandleCache(client, scfg), FundingTracker(client, store), engine, store,
                           ucfg, scfg, fcfg, top=a.top, quiet=a.quiet,
                           coins=[c.strip().upper() for c in a.coins.split(",") if c.strip()] or None)
+        if a.convex or a.live:
+            hook = build_convex_hook(a, acct, client, store, telegram)
+            if hook is None:
+                if store:
+                    store.close()
+                return
+            scanner.hooks.append(hook)
 
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -1090,11 +1253,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     a = parse_args(argv)
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S", stream=sys.stderr)
-    if a.events is not None or a.scans:
+    views = {"events": a.events, "signals": a.signals, "orders": a.orders, "scans": a.top if a.scans else None}
+    wanted = [k for k, v in views.items() if v is not None]
+    if wanted:
         if not a.db or not os.path.exists(a.db):
             print(f"no database at {a.db!r}", file=sys.stderr)
             return 1
-        show_db(a.db, "events" if a.events is not None else "scans", a.events or a.top)
+        for k in wanted:
+            show_db(a.db, k, views[k])
         return 0
     try:
         from dotenv import load_dotenv  # optional; real env vars work without it
