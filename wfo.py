@@ -200,11 +200,15 @@ class SimTrade:
 
 
 def simulate(series: dict, L: int, trail: float, start_ms: int, end_ms: int, cfg: WFOConfig,
-             bcfg: BreakoutConfig, rcfg: RiskConfig, funding: Optional[Callable] = None) -> list:
-    """Replay every eligible coin bar by bar with portfolio limits. Entries at bar close × (1 ± slip), the
-    entry bar's adverse extreme is tested against the stop (conservative), exits at the stop ∓ slip."""
+             bcfg: BreakoutConfig, rcfg: RiskConfig, funding: Optional[Callable] = None,
+             signals: Optional[dict] = None) -> list:
+    """Replay every eligible coin bar by bar with portfolio limits. Entries at the signal bar's close × (1 ± slip);
+    the stop is first tested on the bar after the signal bar (the live fill happens minutes after the close), exits
+    at the stop ∓ slip, no gap-through. `signals` (coin → ±1/0 per bar) replaces the breakout rule — used by the
+    random-entry control, which also skips the breakout-only "next open back inside the range" check."""
     rm = ConvexRiskManager(replace(rcfg, trail_atr_mult=trail))
-    sig = {coin: signals_for(s, L, bcfg) for coin, s in series.items()}
+    injected = signals is not None
+    sig = signals if injected else {coin: signals_for(s, L, bcfg) for coin, s in series.items()}
     bands = {coin: donchian(s, L) for coin, s in series.items()}
     hours = sorted({int(x) for s in series.values() for x in s.t if start_ms <= int(x) < end_ms})
     e_slip, x_slip, fee = cfg.entry_slip_bps / 1e4, cfg.exit_slip_bps / 1e4, cfg.taker_fee
@@ -237,13 +241,13 @@ def simulate(series: dict, L: int, trail: float, start_ms: int, end_ms: int, cfg
             pos.stop, pos.stage = rm.desired_stop(pos, atr)
         for coin, s in series.items():                               # 2. entries on the bar that just closed
             i = s.idx.get(t)
-            if i is None or sig[coin][i] == 0 or i + 1 >= len(s.t) or coin in open_pos:
+            if i is None or coin not in sig or sig[coin][i] == 0 or i + 1 >= len(s.t) or coin in open_pos:
                 continue
             if cooldown.get(coin, 0) > t + HOUR_MS or len(open_pos) >= cfg.max_positions:
                 continue
             d = int(sig[coin][i])
             upper, lower = bands[coin]
-            if (d > 0 and s.o[i + 1] <= upper[i]) or (d < 0 and s.o[i + 1] >= lower[i]):
+            if not injected and ((d > 0 and s.o[i + 1] <= upper[i]) or (d < 0 and s.o[i + 1] >= lower[i])):
                 continue                                             # next open already back inside the range
             atr = s.atr[i]
             if not np.isfinite(atr) or atr <= 0:

@@ -75,9 +75,9 @@ def test_client_survives_429_and_backs_off():
                 scanner = Scanner(client, CandleCache(client, scfg), FundingTracker(client), StateEngine(ecfg, acct, []),
                                   None, ucfg, scfg, fcfg, quiet=True)
                 rows = await scanner.cycle()
-                return rows, dict(calls), lim.n_429, lim.rate, lim.max_rate
-    rows, calls, n429, rate, max_rate = asyncio.run(go())
-    assert calls["429"] == 2 and n429 == 2
+                return rows, dict(calls), lim.n_429, lim.rate, lim.max_rate, client.consecutive_429
+    rows, calls, n429, rate, max_rate, consecutive = asyncio.run(go())
+    assert calls["429"] == 2 and n429 == 2 and consecutive == 0        # the counter resets on the first success
     assert calls["candleSnapshot"] == 8 + 2                 # every series still loaded, two retries
     assert {r.ctx.coin for r in rows} == {"AAA", "BBB", "GGG", "KKK"}
     assert rate == max_rate / 4                             # halved twice, no recovery yet
@@ -195,3 +195,12 @@ def test_end_to_end_pipeline(tmp_path, capsys):
     assert "FIRE" in out and "GGG" in out and "AAA" in out and "ARMED" in out
     assert "vol_z=nan" in out and "KKK" in out and " dry " in out and "STOP_OID" in out
     assert main(["--db", str(tmp_path / "missing.db"), "--scans"]) == 1
+
+
+def test_429_backoff_doubles_per_consecutive_hit_and_honours_retry_after():
+    from squeeze_scanner import backoff_429
+    assert [backoff_429(n, 30, 300, rnd=0.5) for n in (1, 2, 3, 4, 5, 6)] == [30, 60, 120, 240, 300, 300]
+    assert backoff_429(1, 30, 300, retry_after="45", rnd=0.5) == 45       # server asks for longer: obey
+    assert backoff_429(2, 30, 300, retry_after="45", rnd=0.5) == 60       # server asks for less: keep our schedule
+    assert backoff_429(1, 30, 300, retry_after="soon", rnd=0.5) == 30     # unparseable header ignored
+    assert backoff_429(1, 30, 300, rnd=0.0) == 24 and backoff_429(1, 30, 300, rnd=1.0) == 36   # ±20 % jitter

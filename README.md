@@ -25,9 +25,10 @@ weekly wfo.py: replay of the logged window over Donchian 16–32 × Chandelier 2
 
 ```bash
 make setup                 # python3 -m venv .venv && pip install -r requirements.txt
-make test                  # 48 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
+make test                  # 55 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
 make stress                # expectancy / streak / drawdown Monte Carlo on the stated profile (no market data)
 make study                 # ~200-day replay of the current universe, nested filter variants with n and SE (API, ~10 min)
+make diag                  # study --diag --offline: forward-return profile, random-entry control, stop velocity (cache only)
 make once                  # one cycle, prints the table (first run loads ~2 candle series per coin)
 make once ARGS=--convex    # same, plus the breakout engine in dry mode
 make run ARGS=--convex     # loop every 60s; Ctrl-C to stop
@@ -272,6 +273,28 @@ log). **What biases it:** survivorship — today's $2–40M universe applied to 
 grew into the band and excludes those that died out of it; paper fills at the IOC bound; one 200-day window is
 one regime. A variant that only looks good in one half, or whose long and short legs disagree, is not evidence.
 
+**First result (2026-10-06, 50 coins, 2026-03-20 → 10-06):** no detectable edge. `DVC` n=1,462, avgR −0.117 ± 0.06
+(not distinguishable from zero); short leg negative in every variant (DVC −0.273 ± 0.06, 4.7σ), long leg zero
+(+0.040 ± 0.11); `D` −0.196 ± 0.02; volume z adds nothing; compression improves by 0.08 ± 0.06R (1.3σ). Win rate
+31–33 % as assumed, but payoff 1.7–2.2 — not the 4.5 the risk profile was built on. Full report: `state/study.txt`.
+
+**`--diag`** (`make diag`, runs from the candle cache with `--offline`, no API calls) separates "the entry carries no
+information" from "the exits strangle it" with three pre-registered checks, no parameter search:
+
+1. **Forward profile** — close-to-close return of every `D` and `DVC` signal bar at +1/+4/+12/+24/+48 bars, signed
+   by direction, in the signal bar's ATR(14) units and in %, per leg, mean ± SE clustered by coin × 48-bar block
+   (signals of one coin overlap), against the drift of all eligible bars (survivorship shows up here). Gate: a long
+   leg ≤ 0 at every horizon means the thesis is dead; positive at +24/+48 while the strategy loses means the exits.
+2. **Random-entry control** — 10 seeds × 2,000 random entries per side through the same exit engine and costs.
+   The exit engine's own expectancy on these coins is not −friction: a stop that fills on a wick sells a transient
+   dip, and on a driftless synthetic walk with realistic wicks the engine alone runs −0.2 to −0.3R per trade
+   before costs. `DVC − random` is the entry's contribution, with its SE.
+3. **Stop velocity** — share of full stops hit within ≤ 3 bars of entry, median bars to stop, and how many of those
+   early stops reached +2R within 48 bars anyway (what a wider stop would have caught), for `DVC` and the control.
+
+Plus the `DVC` exits by reason (full stop / break-even / Chandelier / open at end: n and mean R) and the friction
+reference (median stop width in % of price, round trip in R).
+
 ## Output
 
 Table legend is printed under each table. sqlite tables (`state/s38.db`): `scans` (one row per coin per cycle:
@@ -293,8 +316,10 @@ on the same box or behind the same router shares it: the house IP carries the li
 request was answered 429, i.e. the IP was already saturated before this scanner sent anything.
 
 `--weight` is therefore a *ceiling*, not a reservation. The limiter has no start-up burst (two calls), halves its
-rate on every 429 (floor 10 % of the ceiling) and owes 30 s of silence, then recovers linearly over 10 minutes
-without further 429s; each cycle line logs `N×429, budget X/min`. Defaults: 600 from the CLI, 300 in the
+rate on every 429 (floor 10 % of the ceiling) and owes a pause that **doubles per consecutive 429** — 30 s, 60 s,
+120 s, 240 s, 300 s cap, ±20 % jitter, or the server's `Retry-After` if longer — resetting on the first successful
+response; the rate then recovers linearly over 10 minutes without further 429s. 5xx and network errors back off
+1.5 s × 2^attempt per call (cap 30 s, 5 attempts). Each cycle line logs `N×429, budget X/min`. Defaults: 600 from the CLI, 300 in the
 hospitality1 unit. Cold start = 2 candle series per eligible coin: 48 coins ⇒ 96 calls ⇒ ~6.5 min at 300/min
 (observed: 5.5 min at 400 with 17 retried 429s); afterwards a cycle costs 1 call plus one refresh per coin per
 closed bar (1h: ~48 calls once an hour; 4h: every 4 hours). If s16's journal shows 429s in the minutes after this

@@ -66,7 +66,8 @@ class ClientConfig:
     max_concurrency: int = 2
     timeout_s: float = 15.0
     max_retries: int = 4
-    penalty_s: float = 30.0      # silence owed after a 429 (the shared IP is saturated)
+    penalty_s: float = 30.0      # silence owed after the first 429 (the shared IP is saturated); doubles per consecutive 429
+    penalty_cap_s: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -345,8 +346,26 @@ class WeightLimiter:
         return self.rate * 60.0
 
 
+def backoff_429(consecutive: int, base_s: float, cap_s: float, retry_after: Optional[str] = None,
+                jitter: float = 0.2, rnd: float = 0.5) -> float:
+    """Pause after the n-th consecutive 429: base × 2^(n−1) capped, ±jitter, never below a numeric Retry-After."""
+    pause = min(cap_s, base_s * 2 ** max(0, consecutive - 1))
+    pause *= 1.0 + jitter * (2.0 * rnd - 1.0)
+    try:
+        if retry_after is not None:
+            pause = max(pause, float(retry_after))
+    except ValueError:
+        pass
+    return pause
+
+
 class HLInfoClient:
-    """Typed wrapper over POST /info. Every call here has weight 20."""
+    """Typed wrapper over POST /info. Every call here has weight 20.
+
+    429 handling is process-wide, because a 429 means the IP's 1200/min is saturated (every process on the box shares
+    it): the limiter halves its rate and owes a pause that doubles per consecutive 429 — 30 s, 60 s, 120 s, 240 s,
+    300 s (cap), ±20 % jitter, or the server's Retry-After if longer — and resets on the first successful response.
+    5xx and network errors back off 1.5 s × 2^attempt (cap 30 s) per call."""
 
     WEIGHT = 20
 
@@ -356,6 +375,7 @@ class HLInfoClient:
         self.limiter = limiter
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
         self.calls = Counter()
+        self.consecutive_429 = 0
 
     async def _post(self, body: dict, weight: int = WEIGHT) -> Any:
         url = f"{self.cfg.base_url}/info"
@@ -371,9 +391,13 @@ class HLInfoClient:
                     ) as r:
                         if r.status == 429:
                             last_err = HLError(f"HTTP 429 for {kind}")
-                            budget = self.limiter.penalize(self.cfg.penalty_s)
-                            log.warning("HTTP 429 for %s — IP budget saturated; scanner budget cut to %.0f weight/min, "
-                                        "pausing %.0fs (attempt %d)", kind, budget, self.cfg.penalty_s, attempt + 1)
+                            self.consecutive_429 += 1
+                            pause = backoff_429(self.consecutive_429, self.cfg.penalty_s, self.cfg.penalty_cap_s,
+                                                r.headers.get("Retry-After"), rnd=time.monotonic() % 1.0)
+                            budget = self.limiter.penalize(pause)
+                            log.warning("HTTP 429 for %s — IP budget saturated; budget cut to %.0f weight/min, "
+                                        "pausing %.0fs (consecutive 429 #%d, attempt %d)", kind, budget, pause,
+                                        self.consecutive_429, attempt + 1)
                             continue                      # the limiter's debt paces the retry
                         if r.status >= 500:
                             last_err = HLError(f"HTTP {r.status} for {kind}")
@@ -381,6 +405,7 @@ class HLInfoClient:
                         elif r.status >= 400:
                             raise HLError(f"HTTP {r.status} for {kind}: {(await r.text())[:200]}")
                         else:
+                            self.consecutive_429 = 0
                             return await r.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_err = e
