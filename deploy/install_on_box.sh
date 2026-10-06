@@ -9,7 +9,7 @@ python3 -c "import aiohttp, numpy, dotenv, pytest, hyperliquid, eth_account" 2>/
 mkdir -p state
 [ -f .env ] || { cp env.sample .env; echo "!! created $D/.env from sample — optional: TELEGRAM_* for alerts; HL_* only for --live"; }
 chmod 600 .env
-python3 -m py_compile squeeze_scanner.py convex_engine.py risk_manager.py portfolio.py wfo.py stress_test.py study.py && echo "compile OK"
+python3 -m py_compile squeeze_scanner.py convex_engine.py risk_manager.py portfolio.py wfo.py stress_test.py study.py xs_portfolio.py && echo "compile OK"
 python3 -m pytest -q -p no:cacheprovider tests && echo "offline tests OK"
 cp deploy/s38-squeeze.service deploy/s38-wfo.service deploy/s38-wfo.timer /etc/systemd/system/
 systemctl daemon-reload
@@ -20,3 +20,5 @@ echo "views: python3 squeeze_scanner.py --scans | --events 30 | --signals | --or
 echo "WFO by hand: python3 wfo.py --report-only   (never changes params)"
 echo "edge study:  python3 study.py --weight 300   (~200 days × universe, nested variants; ~10 min, read-only)"
 echo "diagnostics: python3 study.py --diag --offline   (forward profile, random-entry control, stop velocity; cache only)"
+echo "point-in-time: python3 study.py --pit --diag --weight 180   (all perps, one-off ~25 min fetch; then add --offline)"
+echo "next vector: python3 xs_portfolio.py   (cross-sectional book on the cache; --fetch-funding for carry)"

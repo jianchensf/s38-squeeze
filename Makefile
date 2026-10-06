@@ -1,6 +1,6 @@
 # s38-squeeze — Hyperliquid BB/KC squeeze + funding-fuel scanner (read-only, no orders).
 PY := $(shell [ -x .venv/bin/python3 ] && echo .venv/bin/python3 || echo python3)
-.PHONY: help setup test stress study diag once run events scans signals orders positions trades wfo wfo-apply
+.PHONY: help setup test stress study diag pit xs once run events scans signals orders positions trades wfo wfo-apply
 
 help:
 	@echo "  make setup    venv + requirements"
@@ -8,6 +8,8 @@ help:
 	@echo "  make stress   expectancy / losing-streak / drawdown Monte Carlo on the stated profile"
 	@echo "  make study    ~200-day replay of the current universe, nested filter variants with n and SE (needs the API; ~10 min)"
 	@echo "  make diag     study --diag --offline: forward-return profile, random-entry control, stop velocity (candle cache only)"
+	@echo "  make pit      study --pit --diag: point-in-time universe over every perp (one-off ~25 min fetch), gate, step 2"
+	@echo "  make xs       xs_portfolio.py: cross-sectional momentum / funding-carry book on the point-in-time cache"
 	@echo "  make once     one cycle, print table   (ARGS=\"--convex\" adds the breakout engine, dry)"
 	@echo "  make run      loop every 60s (Ctrl-C to stop); hospitality1 unit + installer in deploy/"
 	@echo "  make events   last 30 state transitions from state/s38.db"
@@ -33,6 +35,12 @@ study:
 
 diag:
 	$(PY) study.py --diag --offline $(ARGS)
+
+pit:
+	$(PY) study.py --pit --diag --weight 180 $(ARGS)
+
+xs:
+	$(PY) xs_portfolio.py $(ARGS)
 
 once:
 	$(PY) squeeze_scanner.py --once $(ARGS)

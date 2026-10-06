@@ -274,6 +274,13 @@ def test_fetch_candles_fills_the_head_of_a_partial_cache(tmp_path):
     assert len([c for c in calls if c[0] == "AAA"]) == 1 and calls[0][1] == bars[0].t and calls[0][2] < bars[200].t
     assert "NEW" not in out and len([c for c in calls if c[0] == "NEW"]) == 1   # unknown coin: one empty request, no entry
     calls.clear()
-    out = asyncio.run(fetch_candles(store, Client(), ["AAA"], bars[0].t, t_end))
-    assert calls == [] and len(out["AAA"]) == 300                   # fully cached: no request
+    out = asyncio.run(fetch_candles(store, Client(), ["AAA", "NEW"], bars[0].t, t_end))
+    assert calls == [] and len(out["AAA"]) == 300                   # fully cached, and NEW's empty window is not re-asked
+    store.write_candles("LATE", bars[250:])                          # a coin listed late: cached tail only
+    calls.clear()
+    out = asyncio.run(fetch_candles(store, Client(), ["LATE"], bars[0].t, t_end))
+    assert len(calls) == 1 and calls[0][1] == bars[0].t              # head asked once (returns nothing) …
+    calls.clear()
+    out = asyncio.run(fetch_candles(store, Client(), ["LATE"], bars[0].t, t_end))
+    assert calls == [] and len(out["LATE"]) == 50                    # … and never again
     store.close()

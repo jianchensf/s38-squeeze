@@ -975,6 +975,7 @@ class Store:
         ts INTEGER PRIMARY KEY, window_start INTEGER, window_end INTEGER, split_ms INTEGER, n_coins INTEGER,
         chosen_donchian INTEGER, chosen_trail REAL, adopted INTEGER, verdict TEXT, detail TEXT);
     CREATE TABLE IF NOT EXISTS candles (coin TEXT, t INTEGER, o REAL, h REAL, l REAL, c REAL, v REAL, PRIMARY KEY (coin, t));
+    CREATE TABLE IF NOT EXISTS candle_requests (coin TEXT PRIMARY KEY, start_ms INTEGER, end_ms INTEGER);
     CREATE TABLE IF NOT EXISTS equity_curve (ts INTEGER, mode TEXT, equity REAL, PRIMARY KEY (ts, mode));
     """
 
@@ -1132,6 +1133,27 @@ class Store:
         rows = self.con.execute("SELECT t, o, h, l, c, v FROM candles WHERE coin=? AND t>=? AND t<=? ORDER BY t",
                                 (coin, start_ms, end_ms)).fetchall()
         return [Candle(t, t + HOUR_MS - 1, o, h, l, c, v, 0) for t, o, h, l, c, v in rows]
+
+    def candle_request_span(self, coin: str) -> Optional[tuple]:
+        """(earliest start, latest end) ever asked of the API for this coin — so an empty head or a coin with no
+        data is not re-requested on every run."""
+        row = self.con.execute("SELECT start_ms, end_ms FROM candle_requests WHERE coin=?", (coin,)).fetchone()
+        return (int(row[0]), int(row[1])) if row else None
+
+    def mark_candle_request(self, coin: str, start_ms: int, end_ms: int) -> None:
+        prev = self.candle_request_span(coin)
+        a = min(start_ms, prev[0]) if prev else start_ms
+        b = max(end_ms, prev[1]) if prev else end_ms
+        self.con.execute("INSERT OR REPLACE INTO candle_requests VALUES (?,?,?)", (coin, int(a), int(b)))
+        self.con.commit()
+
+    def cached_coins(self) -> list:
+        return [c for (c,) in self.con.execute("SELECT DISTINCT coin FROM candles ORDER BY coin")]
+
+    def latest_day_ntl_vlm(self) -> dict:
+        """coin -> HL dayNtlVlm at the latest scan (to check the unit of candle volume against)."""
+        return {c: float(v) for c, v in self.con.execute(
+            "SELECT coin, day_ntl_vlm FROM scans WHERE ts = (SELECT MAX(ts) FROM scans)") if v is not None}
 
     def eligibility(self, start_ms: int, end_ms: int) -> dict:
         """coin -> set of hour-open ms during which the coin was in the scanned universe (one scan row per cycle)."""

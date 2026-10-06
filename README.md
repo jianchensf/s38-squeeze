@@ -25,10 +25,12 @@ weekly wfo.py: replay of the logged window over Donchian 16–32 × Chandelier 2
 
 ```bash
 make setup                 # python3 -m venv .venv && pip install -r requirements.txt
-make test                  # 55 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
+make test                  # 65 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
 make stress                # expectancy / streak / drawdown Monte Carlo on the stated profile (no market data)
 make study                 # ~200-day replay of the current universe, nested filter variants with n and SE (API, ~10 min)
 make diag                  # study --diag --offline: forward-return profile, random-entry control, stop velocity (cache only)
+make pit                   # study --pit --diag: point-in-time universe over every perp (one-off ~25 min fetch at 180 weight/min), gate, step 2
+make xs                    # xs_portfolio.py: cross-sectional momentum / funding-carry book on the point-in-time cache (offline)
 make once                  # one cycle, prints the table (first run loads ~2 candle series per coin)
 make once ARGS=--convex    # same, plus the breakout engine in dry mode
 make run ARGS=--convex     # loop every 60s; Ctrl-C to stop
@@ -295,6 +297,61 @@ information" from "the exits strangle it" with three pre-registered checks, no p
 Plus the `DVC` exits by reason (full stop / break-even / Chandelier / open at end: n and mean R) and the friction
 reference (median stop width in % of price, round trip in R).
 
+**Diag result on the current universe (2026-10-06):** the gate split by leg. Long `DVC` signals carry forward
+information that grows with horizon — +0.33 ± 0.14 ATR at +12, +0.62 ± 0.21 at +24, +1.87 ± 0.37 at +48 (net of
+drift +1.38 ± 0.38, 3.6σ coin-clustered), hit rate ≈ 0.50 at every horizon (a fat right tail, not direction) — while
+the exit engine exits at a median of 5 bars and nets +0.044R, only +0.12 ± 0.11R above random entries. Short signals
+move exactly like the drift (zero information; their negative expectancy is the drift). 40 % of `DVC` full stops hit
+within 3 bars vs 30 % for random entries. Two defects were suspected in the +48 number before acting on it, hence
+`--pit` below: survivorship *conditional on breakouts* (coins grew into the band through their breakouts) and
+cross-sectional clustering (25 coins breaking out in the same alt rally are one observation).
+
+### Point-in-time universe, two-way clustering, gate and step 2 (`--pit`, `make pit`)
+
+`--pit` fetches 1h candles for **every perp HL lists, delisted included** (~230 series, once; `--weight 180` ≈ 9
+calls/min ≈ 25 min, then `--offline`) and makes a coin eligible at bar *t* only if its trailing-24h notional
+Σ volume × close was inside the band at that bar — the universe as it was, not as it is. It prints the universe
+profile (median eligible names per hour, how many of today's names were eligible on day one) and a volume-unit check
+(Σ v·c over the last 24 bars vs HL's `dayNtlVlm`; ≈ 1 confirms candle `v` is base units). With `--diag` the forward
+profile then reports two SEs — coin × 48-bar block (`cb`) and **two-way coin + time block** (`2w`,
+Cameron–Gelbach–Miller) — and for `DVC` at +12/+24/+48 the net excess over drift with its two-way σ, the share of the
+total net excess from the top-1 / top-5 coins, the leave-one-coin-out minimum and the jackknife SE.
+
+**Gate (pre-registered):** long net excess at +48 ≥ +0.50 ATR, ≥ 2.0σ on the two-way SE, top-1 coin < 30 % of the
+net excess. **PASS →** step 2 runs in the same invocation: long-only `DVC` signals under two pre-registered exit
+rules against the current ratchet, free and with the book's limits, each with its own random-entry control through
+the same rule (`signal − random` in ATR units is the entry's contribution under that exit):
+
+| rule | exit |
+|---|---|
+| A | 48-bar time exit; 3 × ATR disaster stop only |
+| B | stop at the signal bar's low (floored 0.5 ATR below entry); at +1.5R ratchet to entry + 0.1R; 48-bar time exit |
+| C | the current ratchet: 1.5 × ATR stop, +2R break-even, +3R Chandelier 2.5 × ATR |
+
+Metrics: n, win rate ± SE, payoff, avg R ± SE (R = each rule's own initial risk), avg return in entry-bar ATR units
+± SE (the cross-rule comparable), annualised Sharpe ± SE, max drawdown in ΣR and compounding at 1 %, both halves,
+exits by reason. **FAIL →** the directional breakout engine is hard-killed and the next vector is
+`xs_portfolio.py`. `--step2` forces step 2 for inspection after a FAIL; it is not a licence to trade it.
+
+## Next vector: cross-sectional book (`xs_portfolio.py`, `make xs`)
+
+Market-neutral long/short portfolios on the point-in-time candle cache — no directional thesis, no stops; the
+edge, if any, is the cross-section. Two pre-registered signals: **momentum** (trailing return over 24 / 72 / 168
+bars, skipping the most recent bar) and **funding carry** (mean hourly funding over the last 24 h: long the names
+paid to hold, short the names paying — needs `--fetch-funding`, paged `fundingHistory` into `funding_hourly`, ~60
+days for the eligible names ≈ 40 min at 180 weight/min). Every 8 or 24 h: rank the eligible names, long the top
+decile, short the bottom decile (≥ 3 per side, 50 % of capital per side, equal weight), entry at the rebalance close
+± slip, 9.5 bps per unit of turnover (names kept across rebalances cost nothing), funding paid/received hourly when
+cached, delisted names exit at their last print. Reported per config: mean ± SE per period (bps), Sharpe ± SE, hit
+rate, max DD, turnover, **each leg's cross-sectional excess over the eligible-universe mean** (what a neutral book
+earns), both halves; a decile table for `mom72/24h` (a real effect is monotone across deciles, not a top-decile
+fluke). 8 configs: one 2σ by chance is routine — the bar is ≥ 3σ and the same sign across L and R.
+
+What a pass would lead to: a rebalancing book (not the scanner) — target weights from the chosen signal every R
+hours, IOC-with-bound orders to move from current to target, the existing risk layer's breaker and equity
+persistence, paper first. What it does not solve: fills in thin names (the slippage assumption is the weak point
+of every cross-sectional backtest on mid-caps) and funding-rate regime shifts.
+
 ## Output
 
 Table legend is printed under each table. sqlite tables (`state/s38.db`): `scans` (one row per coin per cycle:
@@ -366,10 +423,11 @@ itself on first start; the installer also enables the weekly `s38-wfo.timer` —
 1. Run `--convex` in dry mode on hospitality1 and let `signals` / `orders` / `trades` accumulate. Review with
    `make signals`, `make orders`, `make positions`, `make trades`: how many breakouts pass each filter, where the
    paper fills were, how the ratchet exited them, and the realized win rate / payoff with standard errors.
-2. **Historical study** (`make study`, section above): the same entry and exit code replayed over ~200 days of
-   the current universe in nested variants, with n and standard errors per leg and per half. The bar: `DVC`
-   positive at ≥ 2σ on n ≥ 50, both halves and both legs with the same sign, and the live rule not worse than the
-   plain breakout after costs. OI cannot be backtested (no history endpoint), so the OI filter's marginal value
-   can only be measured live from the dry log.
+2. **Historical study** (`make study` → `make diag` → `make pit`, sections above): the same entry and exit code
+   replayed over ~200 days, first on the current universe (done: no edge through the current exits; long signals
+   carry slow right-skewed information, shorts none), then on the point-in-time universe with two-way clustered
+   SEs and the pre-registered gate. PASS → step 2's exit rules decide what, if anything, goes to paper, long-only.
+   FAIL → hard-kill; `make xs` is the next vector. OI cannot be backtested (no history endpoint), so the OI filter's
+   marginal value can only be measured live from the dry log.
 3. Only if 1–2 hold up: `--live` on a dedicated $1k sub-account driven by an API wallet, `--max-positions 3`,
    1 % bootstrap risk; Kelly takes over from the 21st live trade.

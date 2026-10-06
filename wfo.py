@@ -197,6 +197,7 @@ class SimTrade:
     r: float                    # net of fees (and funding when available), in R
     stage: int
     reason: str
+    atr_net: float = float("nan")   # the same net return in units of the entry bar's ATR (comparable across exit rules)
 
 
 def simulate(series: dict, L: int, trail: float, start_ms: int, end_ms: int, cfg: WFOConfig,
@@ -223,7 +224,8 @@ def simulate(series: dict, L: int, trail: float, start_ms: int, end_ms: int, cfg
         if funding is not None:
             fund = -pos.direction * pos.entry_px * sum(rate for _, rate in funding(pos.coin, pos.opened_ms, t_close))
         r = (gross - cost + fund) / pos.r_unit
-        trades.append(SimTrade(pos.coin, pos.side, pos.opened_ms, t_close, pos.entry_px, px, pos.r_unit, r, pos.stage, reason))
+        trades.append(SimTrade(pos.coin, pos.side, pos.opened_ms, t_close, pos.entry_px, px, pos.r_unit, r, pos.stage, reason,
+                               (gross - cost + fund) / (pos.r_unit / rcfg.stop_atr_mult)))
         open_pos.pop(pos.coin, None)
         cooldown[pos.coin] = t_close + cfg.cooldown_bars * HOUR_MS
 
@@ -278,6 +280,9 @@ class SetStats:
     sharpe: float = float("nan")      # annualised, from daily R sums (days without trades count as 0)
     sharpe_se: float = float("nan")
     max_dd: float = 0.0               # equity drawdown compounding risk_frac × R per trade
+    max_dd_r: float = 0.0             # peak-to-trough drawdown of cumulative ΣR, in R
+    avg_atr: float = float("nan")     # mean net return in ATR units (when the trades carry it)
+    se_atr: float = float("nan")
     days: int = 0
 
     @property
@@ -305,11 +310,18 @@ def set_stats(trades: Sequence[SimTrade], start_ms: int, end_ms: int, risk_frac:
         st.sharpe = float(s_d * math.sqrt(365))
         st.sharpe_se = float(math.sqrt((1 + 0.5 * s_d * s_d) / days) * math.sqrt(365))
     eq, peak, dd = 1.0, 1.0, 0.0
+    cum, cpeak, ddr = 0.0, 0.0, 0.0
     for t in trades:
         eq *= 1 + risk_frac * t.r
         peak = max(peak, eq)
         dd = max(dd, 1 - eq / peak)
-    st.max_dd = float(dd)
+        cum += t.r
+        cpeak = max(cpeak, cum)
+        ddr = max(ddr, cpeak - cum)
+    st.max_dd, st.max_dd_r = float(dd), float(ddr)
+    a = np.array([t.atr_net for t in trades], dtype=float)
+    if np.isfinite(a).all() and len(a) > 1:
+        st.avg_atr, st.se_atr = float(a.mean()), float(a.std(ddof=1) / math.sqrt(len(a)))
     return st
 
 
@@ -413,17 +425,20 @@ async def fetch_candles(store: Store, client: HLInfoClient, coins: Sequence[str]
     last_closed = last_closed_open_time("1h", end_ms)
     for coin in coins:
         have = store.read_candles(coin, start_ms, last_closed)
+        asked = store.candle_request_span(coin)
         spans = []
-        if not have:
-            spans.append((start_ms, end_ms))
+        if not have:                                                 # nothing cached: ask unless this exact question
+            if asked is None or asked[0] > start_ms or asked[1] < last_closed - DAY_MS:   # was asked within a day
+                spans.append((start_ms, end_ms))
         else:
-            if have[0].t > start_ms + HOUR_MS:
-                spans.append((start_ms, have[0].t - 1))
+            if have[0].t > start_ms + HOUR_MS and (asked is None or asked[0] > start_ms):
+                spans.append((start_ms, have[0].t - 1))          # head: only if never asked from this far back
             if have[-1].t + HOUR_MS <= last_closed:
                 spans.append((have[-1].t + HOUR_MS, end_ms))
         for a, b in spans:
             try:
                 new = [c for c in await client.candles(coin, "1h", a, b) if c.t <= last_closed]
+                store.mark_candle_request(coin, a, b)
                 if new:
                     store.write_candles(coin, new)
             except Exception as e:
