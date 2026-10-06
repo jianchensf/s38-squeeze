@@ -1,11 +1,15 @@
 import asyncio
+import math
 import os
 import time
 
 import aiohttp
 from aiohttp.test_utils import TestServer
 
-from convex_engine import BreakoutConfig, ConvexExecutor, ConvexRunner, ConvexSignalEngine, ExecConfig, OIHistory
+from convex_engine import (BreakoutConfig, ConvexExecutor, ConvexRunner, ConvexSignalEngine, ExecConfig, OIHistory,
+                           compute_breakout)
+from portfolio import PositionBook
+from risk_manager import ConvexRiskManager, RiskConfig
 from squeeze_scanner import (
     ARMED, COOLDOWN, IDLE, AssetCtx, CandleCache, FundingTracker, HLInfoClient, Scanner, StateEngine, Store,
     WeightLimiter, build_configs, filter_universe, last_closed_open_time, main, now_ms, parse_args,
@@ -101,10 +105,13 @@ def test_end_to_end_pipeline(tmp_path, capsys):
                 oi.record("GGG", last_closed_open_time("1h", now_ms()) + 30_000, 900.0)
                 # the synthetic bars are anchored to the wall clock, so relax the freshness guard here
                 # (it is unit-tested in test_convex); everything else runs with production defaults
+                risk = ConvexRiskManager(RiskConfig(bootstrap_risk_frac=acct.risk_pct))
+                book = PositionBook(risk, acct, client, store, live=False)
                 runner = ConvexRunner(ConvexSignalEngine(BreakoutConfig(max_signal_age_s=4000), oi, store),
-                                      ConvexExecutor(ExecConfig(live=False), acct, client, store))
+                                      ConvexExecutor(ExecConfig(live=False), acct, client, store, risk=risk, book=book), book)
                 scanner = Scanner(client, cache, FundingTracker(client, store), engine, store, ucfg, scfg, fcfg,
                                   quiet=True, hooks=[runner.on_cycle])
+                scanner.extra_coins = runner.position_coins
                 rows1 = await scanner.cycle()
                 calls1 = dict(calls)
                 rows2 = await scanner.cycle()
@@ -116,12 +123,13 @@ def test_end_to_end_pipeline(tmp_path, capsys):
             sigs = store.con.execute("SELECT coin, side, accepted, reasons, oi_change FROM signals ORDER BY coin").fetchall()
             orders = store.con.execute("SELECT coin, side, mode, status, sz, notional, stop_px FROM orders").fetchall()
             oi_rows = store.con.execute("SELECT COUNT(*) FROM scans WHERE oi IS NOT NULL").fetchone()[0]
+            open_pos = store.open_positions("dry")
             store.close()
             return (rows1, rows2, calls1, calls2, cap.events, engine, cache, restored, n_scans, n_fund, fires,
-                    sigs, orders, oi_rows, runner)
+                    sigs, orders, oi_rows, runner, open_pos)
 
     (rows1, rows2, calls1, calls2, events, engine, cache, restored, n_scans, n_fund, fires,
-     sigs, orders, oi_rows, runner) = asyncio.run(go())
+     sigs, orders, oi_rows, runner, open_pos) = asyncio.run(go())
 
     # universe → rows
     assert {r.ctx.coin for r in rows1} == {"AAA", "BBB", "GGG", "KKK"}
@@ -158,14 +166,20 @@ def test_end_to_end_pipeline(tmp_path, capsys):
 
     # convex engine: KKK has squeeze + Donchian break + volume spike + OI +4% → one dry order;
     # GGG breaks out on flat volume → rejected; the same bars are not re-evaluated on cycle 2
-    assert calls1["allMids"] == 1 and calls2["allMids"] == 1
+    assert calls1["allMids"] == 1 and calls2["allMids"] == 2       # cycle 2: one mids call to mark the open paper position
     assert [(c, s, ok) for c, s, ok, _, _ in sigs] == [("GGG", "long", 0), ("KKK", "long", 1)]
     assert "vol_z=nan" in sigs[0][3] and abs(sigs[1][4] - 0.04) < 1e-9
     assert len(orders) == 1
     coin, side, mode, status, sz, notional, stop_px = orders[0]
     assert (coin, side, mode, status) == ("KKK", "long", "dry", "dry")
-    assert sz > 0 and abs(notional - sz * 110.0) < 1e-6 and stop_px == 99.5          # breakout bar low
+    atr = compute_breakout(cache._bars[("KKK", "1h")], BreakoutConfig()).atr
+    assert sz == math.floor(5000 * 0.01 / (1.5 * atr) * 10) / 10 and abs(notional - sz * 110.0) < 1e-6
+    assert abs(stop_px - round(110.08 - 1.5 * atr, 2)) < 0.011                          # 1.5 × ATR14 below the paper fill
     assert runner.executor._dry_positions == {"KKK": rows1[0].ts}
+    # the paper position lives in the book and survives a restart via the store; cycle 2 kept it open
+    assert list(runner.book.positions) == ["KKK"] and runner.position_coins() == {"KKK"}
+    assert len(open_pos) == 1 and open_pos[0].coin == "KKK" and open_pos[0].entry_px == 110.08 and open_pos[0].stage == 0
+    assert abs(open_pos[0].stop - (110.08 - 1.5 * atr)) < 1e-9 and open_pos[0].size == sz
 
     # persistence + restore
     assert n_scans == 8 and n_fund >= 24 and oi_rows == 8
@@ -176,8 +190,8 @@ def test_end_to_end_pipeline(tmp_path, capsys):
     # db viewers used by `make events` / `make scans` / `make signals` / `make orders`
     assert main(["--db", db, "--events", "10"]) == 0
     assert main(["--db", db, "--scans"]) == 0
-    assert main(["--db", db, "--signals", "--orders"]) == 0
+    assert main(["--db", db, "--signals", "--orders", "--positions", "--trades"]) == 0
     out = capsys.readouterr().out
     assert "FIRE" in out and "GGG" in out and "AAA" in out and "ARMED" in out
-    assert "vol_z=nan" in out and "KKK" in out and " dry " in out
+    assert "vol_z=nan" in out and "KKK" in out and " dry " in out and "STOP_OID" in out
     assert main(["--db", str(tmp_path / "missing.db"), "--scans"]) == 1

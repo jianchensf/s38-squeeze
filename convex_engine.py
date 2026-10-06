@@ -46,7 +46,7 @@ class BreakoutConfig:
     donchian_len: int = 20          # prior-N highs/lows; the breakout bar itself is excluded
     vol_len: int = 20
     vol_z_min: float = 2.5
-    atr_len: int = 20
+    atr_len: int = 14               # ATR carried on the signal; the risk manager's 1.5×ATR(14) stop uses it
     oi_min_change: float = 0.03     # OI(bar close) / OI(bar open) − 1
     oi_tolerance_s: float = 300.0   # an OI sample must sit within ±5 min of the bar open
     require_squeeze: bool = True
@@ -276,6 +276,10 @@ class OrderPlan:
     is_cross: bool
     risk_usd: float
     equity: float
+    atr: float = 0.0            # ATR(14) at signal time; the post-fill stop is fill ∓ 1.5·ATR
+    sz_decimals: int = 0
+    entry_bar: int = 0
+    size_note: str = ""
 
 
 @dataclass
@@ -303,6 +307,7 @@ class Gateway(Protocol):
     """Signs and sends exchange requests. HLGateway wraps the official SDK; tests inject a fake."""
     def order(self, coin: str, is_buy: bool, sz: float, limit_px: float, order_type: dict, reduce_only: bool = False) -> Any: ...
     def update_leverage(self, leverage: int, coin: str, is_cross: bool = True) -> Any: ...
+    def cancel(self, coin: str, oid: int) -> Any: ...
 
 
 class HLGateway:
@@ -319,6 +324,9 @@ class HLGateway:
 
     def update_leverage(self, leverage, coin, is_cross=True):
         return self.exchange.update_leverage(leverage, coin, is_cross)
+
+    def cancel(self, coin, oid):
+        return self.exchange.cancel(coin, oid)
 
 
 def parse_order_response(resp: Any) -> tuple:
@@ -339,17 +347,24 @@ def parse_order_response(resp: Any) -> tuple:
 
 
 class ConvexExecutor:
-    """One IOC entry per signal under position/cooldown/kill-switch limits, then a resting reduce-only stop."""
+    """One IOC entry per signal under breaker/position/cooldown/kill-switch limits, then a resting reduce-only stop.
+
+    Sizing and the initial stop come from ConvexRiskManager (quarter-Kelly on realized trades, 1.5×ATR(14));
+    fills are registered in the PositionBook, which manages the exit from then on."""
 
     def __init__(self, cfg: ExecConfig, acct: AccountConfig, info: Any, store: Any = None,
                  gateway: Optional[Gateway] = None, account_address: Optional[str] = None,
-                 notify: Optional[Callable[[str], Awaitable[None]]] = None, limiter: Any = None):
+                 notify: Optional[Callable[[str], Awaitable[None]]] = None, limiter: Any = None,
+                 risk: Any = None, book: Any = None):
         if cfg.live and gateway is None:
             raise ValueError("live execution needs a gateway")
+        from risk_manager import ConvexRiskManager, RiskConfig
         self.cfg, self.acct, self.info, self.store = cfg, acct, info, store
         self.gateway, self.account_address, self.notify, self.limiter = gateway, account_address, notify, limiter
+        self.risk = risk or ConvexRiskManager(RiskConfig(bootstrap_risk_frac=acct.risk_pct))
+        self.book = book
         self._cooldown: dict = {}       # coin -> until ms
-        self._dry_positions: dict = {}  # coin -> opened ms (dry mode stand-in for the account state)
+        self._dry_positions: dict = {}  # coin -> opened ms (dry mode stand-in when no book is attached)
         self._lev_set: set = set()
         self.reports: list = []
 
@@ -365,6 +380,8 @@ class ConvexExecutor:
                 if szi:
                     positions[p["coin"]] = szi
             return equity, positions
+        if self.book is not None:
+            return self.book.equity_dry({}), {c: p.size for c, p in self.book.positions.items()}
         horizon = self.cfg.cooldown_bars * HOUR_MS
         self._dry_positions = {c: t for c, t in self._dry_positions.items() if t_ms - t < horizon}
         return self.acct.equity_usd, dict(self._dry_positions)
@@ -372,38 +389,52 @@ class ConvexExecutor:
     # ── sizing ──
     def plan(self, s: ConvexSignal, ctx: AssetCtx, equity: float, ref_px: float) -> Optional[OrderPlan]:
         is_buy = s.direction > 0
-        dist = (ref_px - s.stop_px) if is_buy else (s.stop_px - ref_px)
-        if dist <= 0 or not math.isfinite(dist):
+        if not (s.atr > 0) or not math.isfinite(s.atr):
             return None
-        risk_usd = equity * self.acct.risk_pct
-        sz = risk_usd / dist
+        from risk_manager import TradeStats
+        stats = self.book.stats() if self.book is not None else TradeStats()
         cap = min(equity * self.acct.max_leverage, ctx.day_ntl_vlm * self.acct.max_vlm_frac)
-        sz = floor_sz(min(sz, cap / ref_px), ctx.sz_decimals)
-        notional = sz * ref_px
-        if notional < self.acct.min_notional_usd:
+        dec = self.risk.size(equity, ref_px, s.atr, stats, ctx.sz_decimals, cap, self.acct.min_notional_usd)
+        if dec is None:
             return None
         sd = ctx.sz_decimals
         bound = round_px(ref_px * (1 + self.cfg.max_slippage), sd, "down") if is_buy else \
             round_px(ref_px * (1 - self.cfg.max_slippage), sd, "up")
-        stop = round_px(s.stop_px, sd)
+        stop = round_px(self.risk.initial_stop(ref_px, s.direction, s.atr), sd)
         stop_limit = round_px(stop * (1 - self.cfg.stop_limit_slip), sd, "down") if is_buy else \
             round_px(stop * (1 + self.cfg.stop_limit_slip), sd, "up")
         lev = max(1, min(ctx.max_leverage, self.cfg.leverage))
-        return OrderPlan(coin=s.coin, side=s.side, is_buy=is_buy, sz=sz, bound_px=bound, ref_px=ref_px,
-                         notional=round(notional, 2), stop_px=stop, stop_limit_px=stop_limit, leverage=lev,
-                         is_cross=not ctx.only_isolated, risk_usd=round(sz * dist, 2), equity=equity)
+        return OrderPlan(coin=s.coin, side=s.side, is_buy=is_buy, sz=dec.size, bound_px=bound, ref_px=ref_px,
+                         notional=dec.notional, stop_px=stop, stop_limit_px=stop_limit, leverage=lev,
+                         is_cross=not ctx.only_isolated, risk_usd=dec.risk_usd, equity=equity, atr=s.atr,
+                         sz_decimals=sd, entry_bar=s.bar_time + HOUR_MS, size_note=dec.note)
+
+    def _stop_for_fill(self, plan: OrderPlan, fill_px: float) -> tuple:
+        """Initial stop re-anchored on the actual fill: (trigger, worst limit)."""
+        d = 1 if plan.is_buy else -1
+        sd = plan.sz_decimals
+        stop = round_px(self.risk.initial_stop(fill_px, d, plan.atr), sd)
+        limit = round_px(stop * (1 - self.cfg.stop_limit_slip), sd, "down") if plan.is_buy else \
+            round_px(stop * (1 + self.cfg.stop_limit_slip), sd, "up")
+        return stop, limit
 
     # ── main entry ──
-    async def handle(self, signals: Sequence[ConvexSignal], rows_by_coin: dict, t_ms: int) -> list:
+    async def handle(self, signals: Sequence[ConvexSignal], rows_by_coin: dict, t_ms: int,
+                     mids: Optional[dict] = None) -> list:
         reports: list = []
         if not signals:
             return reports
+        ok, why = self.book.can_enter(t_ms) if self.book is not None else (True, "")
         if os.path.exists(self.cfg.stop_file):
             log.warning("kill switch %s present — %d signal(s) not executed", self.cfg.stop_file, len(signals))
             reports = [self._skip(s, t_ms, "kill_switch") for s in signals]
+        elif not ok:
+            log.warning("%s — %d signal(s) not executed", why, len(signals))
+            reports = [self._skip(s, t_ms, why) for s in signals]
         else:
             equity, positions = await self._account(t_ms)
-            mids = await self.info.all_mids()
+            if mids is None:
+                mids = await self.info.all_mids()
             opened = 0
             for s in signals:
                 ctx = rows_by_coin[s.coin].ctx
@@ -419,7 +450,7 @@ class ConvexExecutor:
                 else:
                     plan = self.plan(s, ctx, equity, ref)
                     if plan is None:
-                        rep = self._skip(s, t_ms, "too_small")
+                        rep = self._skip(s, t_ms, "too_small or no edge")
                     else:
                         rep = await self._send(plan, s, t_ms)
                         if rep.status in ("dry", "filled", "partial"):
@@ -450,11 +481,18 @@ class ConvexExecutor:
                    "stop": {"triggerPx": plan.stop_px, "limit_px": plan.stop_limit_px, "isMarket": True, "tpsl": "sl"}}
         rep.raw = json.dumps(payload)
         if not self.cfg.live:
+            # paper fill at the bound (pessimistic); the book takes the position from here
+            rep.filled_sz, rep.avg_px = plan.sz, plan.bound_px
+            rep.slippage_bps = (plan.bound_px / plan.ref_px - 1.0) * 1e4 * (1 if plan.is_buy else -1)
+            rep.stop_px, _ = self._stop_for_fill(plan, plan.bound_px)
             self._dry_positions[plan.coin] = t_ms
             self._cooldown[plan.coin] = t_ms + self.cfg.cooldown_bars * HOUR_MS
-            log.warning("DRY %s %s %g @ ≤%g (ref %g) notional $%.0f risk $%.2f stop %g — would send %s",
+            if self.book is not None:
+                self.book.register(plan.coin, 1 if plan.is_buy else -1, plan.bound_px, plan.sz, plan.atr, t_ms,
+                                   plan.entry_bar, plan.sz_decimals, None, plan.notional)
+            log.warning("DRY %s %s %g @ %g (ref %g) notional $%.0f risk $%.2f stop %g [%s] — would send %s",
                         plan.side.upper(), plan.coin, plan.sz, plan.bound_px, plan.ref_px, plan.notional,
-                        plan.risk_usd, plan.stop_px, rep.raw)
+                        plan.risk_usd, rep.stop_px, plan.size_note, rep.raw)
             return rep
 
         loop = asyncio.get_running_loop()
@@ -483,20 +521,25 @@ class ConvexExecutor:
             rep.slippage_bps = (avg / plan.ref_px - 1.0) * 1e4 * (1 if plan.is_buy else -1)
             rep.status = "filled" if filled >= plan.sz - 1e-12 else "partial"
             self._cooldown[plan.coin] = t_ms + self.cfg.cooldown_bars * HOUR_MS
-            log.warning("FILLED %s %s %g/%g @ %g (slip %+.1f bps, oid %s)", plan.side.upper(), plan.coin, filled,
-                        plan.sz, avg, rep.slippage_bps, oid)
-            stop_type = {"trigger": {"triggerPx": plan.stop_px, "isMarket": True, "tpsl": "sl"}}
+            log.warning("FILLED %s %s %g/%g @ %g (slip %+.1f bps, oid %s) [%s]", plan.side.upper(), plan.coin, filled,
+                        plan.sz, avg, rep.slippage_bps, oid, plan.size_note)
+            stop_px, stop_limit = self._stop_for_fill(plan, avg)
+            rep.stop_px = stop_px
+            stop_type = {"trigger": {"triggerPx": stop_px, "isMarket": True, "tpsl": "sl"}}
             try:
                 sresp = await loop.run_in_executor(None, gw.order, plan.coin, not plan.is_buy, filled,
-                                                   plan.stop_limit_px, stop_type, True)
+                                                   stop_limit, stop_type, True)
                 sstatus, _, _, soid, serr = parse_order_response(sresp)
                 rep.stop_oid = soid
                 if soid is None:
                     raise RuntimeError(f"stop not accepted: {sstatus} {serr}")
-                log.warning("STOP %s %s %g @ %g (oid %s)", plan.coin, "sell" if plan.is_buy else "buy", filled, plan.stop_px, soid)
+                log.warning("STOP %s %s %g @ %g (oid %s)", plan.coin, "sell" if plan.is_buy else "buy", filled, stop_px, soid)
             except Exception as e:
                 rep.error = f"POSITION UNPROTECTED — stop failed: {e}"
                 log.critical("%s %s: %s", plan.coin, plan.side, rep.error)
+            if self.book is not None:
+                self.book.register(plan.coin, 1 if plan.is_buy else -1, avg, filled, plan.atr, t_ms, plan.entry_bar,
+                                   plan.sz_decimals, rep.stop_oid, filled * avg)
         else:
             rep.status = status if status in ("unfilled", "error") else "error"
             self._cooldown[plan.coin] = t_ms + self.cfg.cooldown_bars_unfilled * HOUR_MS
@@ -519,15 +562,26 @@ def format_report(rep: ExecutionReport) -> str:
 
 
 class ConvexRunner:
-    """Scanner cycle hook: evaluate → execute → log one summary line."""
+    """Scanner cycle hook: manage open positions (book) → evaluate → execute → one summary line."""
 
-    def __init__(self, engine: ConvexSignalEngine, executor: ConvexExecutor):
-        self.engine, self.executor = engine, executor
+    def __init__(self, engine: ConvexSignalEngine, executor: ConvexExecutor, book: Any = None):
+        self.engine, self.executor, self.book = engine, executor, book
 
-    async def on_cycle(self, rows: Sequence[ScanRow], candles: dict, t_ms: int) -> None:
+    def position_coins(self) -> set:
+        return set(self.book.positions) if self.book is not None else set()
+
+    async def on_cycle(self, rows: Sequence[ScanRow], candles: dict, t_ms: int, ctx_all: Optional[dict] = None) -> None:
         signals = self.engine.evaluate(rows, candles, t_ms)
+        mids = None
+        if self.book is not None and (self.book.positions or signals):
+            mids = await self.executor.info.all_mids()
+        if self.book is not None:
+            summary = await self.book.on_cycle(candles, t_ms, mids if mids is not None else {})
+            if self.book.positions or summary["closed"] or summary["tripped"]:
+                from portfolio import format_book
+                log.info(format_book(summary, self.book.mode))
         n_new = len(signals) + len(self.engine.rejections)
-        reports = await self.executor.handle(signals, {r.ctx.coin: r for r in rows}, t_ms) if signals else []
+        reports = await self.executor.handle(signals, {r.ctx.coin: r for r in rows}, t_ms, mids) if signals else []
         if n_new:
             log.info("convex: %d new breakout bar(s) → %d signal(s), %d rejected, %d order report(s)",
                      n_new, len(signals), len(self.engine.rejections), len(reports))

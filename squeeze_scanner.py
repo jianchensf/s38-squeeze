@@ -431,6 +431,20 @@ class HLInfoClient:
             raise HLError("unexpected clearinghouseState payload")
         return data
 
+    async def open_orders(self, address: str) -> list:
+        """Resting orders of an address (coin, oid, side, sz, limitPx, …). Weight 20."""
+        data = await self._post({"type": "openOrders", "user": address})
+        if not isinstance(data, list):
+            raise HLError("unexpected openOrders payload")
+        return data
+
+    async def user_fills_by_time(self, address: str, start_ms: int) -> list:
+        """Fills since start_ms (coin, px, sz, side 'B'/'A', fee, time, oid, …). Weight 20."""
+        data = await self._post({"type": "userFillsByTime", "user": address, "startTime": int(start_ms)})
+        if not isinstance(data, list):
+            raise HLError("unexpected userFillsByTime payload")
+        return data
+
 
 # ───────────────────────────── universe filter ────────────────────────────
 
@@ -892,6 +906,16 @@ class Store:
         ts INTEGER, coin TEXT, side TEXT, mode TEXT, status TEXT, sz REAL, bound_px REAL, ref_px REAL,
         filled_sz REAL, avg_px REAL, slippage_bps REAL, notional REAL, stop_px REAL, oid INTEGER, stop_oid INTEGER,
         error TEXT, raw TEXT);
+    CREATE TABLE IF NOT EXISTS positions (
+        coin TEXT, mode TEXT, opened_ms INTEGER, side TEXT, direction INTEGER, entry_px REAL, size REAL,
+        initial_stop REAL, stop REAL, r_unit REAL, best_px REAL, stage INTEGER, entry_bar INTEGER,
+        last_bar_checked INTEGER, stop_oid INTEGER, risk_usd REAL, notional REAL, fees_usd REAL, sz_decimals INTEGER,
+        status TEXT, closed_ms INTEGER, PRIMARY KEY (coin, mode, opened_ms));
+    CREATE TABLE IF NOT EXISTS trades (
+        opened_ms INTEGER, closed_ms INTEGER, coin TEXT, mode TEXT, side TEXT, entry_px REAL, exit_px REAL, size REAL,
+        r_unit REAL, pnl_usd REAL, r_multiple REAL, fees_usd REAL, stage INTEGER, reason TEXT,
+        PRIMARY KEY (coin, mode, opened_ms));
+    CREATE TABLE IF NOT EXISTS breaker (ts INTEGER PRIMARY KEY, equity REAL, peak REAL, drawdown REAL, halt_until_ms INTEGER);
     """
 
     def __init__(self, path: str):
@@ -965,6 +989,44 @@ class Store:
              r.slippage_bps, r.notional, r.stop_px, r.oid, r.stop_oid, r.error, r.raw))
         self.con.commit()
 
+    # ── risk manager / position book ──
+    POS_COLS = ("coin", "mode", "opened_ms", "side", "direction", "entry_px", "size", "initial_stop", "stop", "r_unit",
+                "best_px", "stage", "entry_bar", "last_bar_checked", "stop_oid", "risk_usd", "notional", "fees_usd",
+                "sz_decimals", "status", "closed_ms")
+
+    def upsert_position(self, p: Any) -> None:
+        self.con.execute(f"INSERT OR REPLACE INTO positions ({','.join(self.POS_COLS)}) VALUES ({','.join('?' * len(self.POS_COLS))})",
+                         tuple(getattr(p, c) for c in self.POS_COLS))
+        self.con.commit()
+
+    def open_positions(self, mode: str) -> list:
+        from risk_manager import Position
+        cur = self.con.execute(f"SELECT {','.join(self.POS_COLS)} FROM positions WHERE mode=? AND status='open'", (mode,))
+        return [Position(**dict(zip(self.POS_COLS, row))) for row in cur.fetchall()]
+
+    def write_trade(self, t: dict) -> None:
+        cols = ("opened_ms", "closed_ms", "coin", "mode", "side", "entry_px", "exit_px", "size", "r_unit", "pnl_usd",
+                "r_multiple", "fees_usd", "stage", "reason")
+        self.con.execute(f"INSERT OR REPLACE INTO trades ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                         tuple(t[c] for c in cols))
+        self.con.commit()
+
+    def trade_r_multiples(self, mode: str) -> list:
+        return [r for (r,) in self.con.execute("SELECT r_multiple FROM trades WHERE mode=? ORDER BY closed_ms", (mode,))]
+
+    def realized_pnl(self, mode: str) -> float:
+        return float(self.con.execute("SELECT COALESCE(SUM(pnl_usd), 0) FROM trades WHERE mode=?", (mode,)).fetchone()[0])
+
+    def write_breaker(self, trip: dict) -> None:
+        self.con.execute("INSERT OR REPLACE INTO breaker VALUES (?,?,?,?,?)",
+                         (trip["ts"], trip["equity"], trip["peak"], trip["drawdown"], trip["halt_until_ms"]))
+        self.con.commit()
+
+    def breaker_state(self) -> Any:
+        from risk_manager import BreakerState
+        row = self.con.execute("SELECT ts, halt_until_ms, (SELECT COUNT(*) FROM breaker) FROM breaker ORDER BY ts DESC LIMIT 1").fetchone()
+        return BreakerState(halt_until_ms=int(row[1]), tripped_ms=int(row[0]), trips=int(row[2])) if row else BreakerState()
+
     def close(self) -> None:
         self.con.close()
 
@@ -1012,13 +1074,16 @@ class Scanner:
         self.ucfg, self.scfg, self.fcfg = ucfg, scfg, fcfg
         self.top, self.quiet = top, quiet
         self.only = set(coins) if coins else None
-        self.hooks = list(hooks or [])      # async fn(rows, candles, t_ms) — e.g. ConvexRunner.on_cycle
+        self.hooks = list(hooks or [])      # async fn(rows, candles, t_ms, ctx_all) — e.g. ConvexRunner.on_cycle
+        self.extra_coins = lambda: set()    # coins to keep fetching even when out of the universe (open positions)
+        self.ctx_all: dict = {}
         self.cycles = 0
 
     async def cycle(self) -> list:
         t_ms = now_ms()
         t0 = time.monotonic()
         assets = await self.client.meta_and_asset_ctxs()
+        self.ctx_all = {a.coin: a for a in assets}
         eligible, reasons = filter_universe(assets, self.ucfg)
         if self.only:
             eligible = [a for a in eligible if a.coin in self.only]
@@ -1029,6 +1094,10 @@ class Scanner:
             self.store.write_universe(t_ms, len(assets), len(eligible), dict(counts))
 
         keys = [(a.coin, tf) for a in eligible for tf in self.scfg.timeframes]
+        held = {a.coin for a in eligible}
+        for coin in sorted(self.extra_coins() - held):       # open positions whose coin left the universe
+            if coin in self.ctx_all:
+                keys.append((coin, self.scfg.timeframes[0]))
         if self.cycles == 0:
             est = len(keys) * HLInfoClient.WEIGHT / self.client.limiter.rate
             log.info("cold start: loading %d candle series (~%.0fs at %d weight/min)", len(keys), est,
@@ -1069,7 +1138,7 @@ class Scanner:
             self.store.write_scans(rows, self.engine.states)
         for hook in self.hooks:
             try:
-                await hook(rows, candles, t_ms)
+                await hook(rows, candles, t_ms, self.ctx_all)
             except Exception:       # a hook must never take the scanner down
                 log.exception("hook %s failed", getattr(hook, "__qualname__", hook))
         self.cache.evict_unseen(t_ms)
@@ -1099,7 +1168,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--tfs", default="1h,4h")
     p.add_argument("--coins", default="", help="debug: restrict to these coins (comma-separated)")
     p.add_argument("--equity", type=float, default=5000.0, help="account equity for sizing (dry mode; live reads the account)")
-    p.add_argument("--risk-pct", type=float, default=1.0, help="risk per trade, percent of equity")
+    p.add_argument("--risk-pct", type=float, default=1.0, help="bootstrap risk per trade (%% of equity) until 20 realized trades exist")
+    p.add_argument("--max-risk-pct", type=float, default=4.0, help="cap on quarter-Kelly risk per trade (%% of equity)")
     p.add_argument("--long-only", action="store_true", help="UP breakouts only (default: both sides)")
     p.add_argument("--weight", type=int, default=600, help="HL weight budget per minute (IP limit is 1200)")
     p.add_argument("--base-url", default="https://api.hyperliquid.xyz")
@@ -1116,6 +1186,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     v.add_argument("--scans", action="store_true", help="latest scan rows ranked by score")
     v.add_argument("--signals", type=int, nargs="?", const=30, metavar="N", help="last N convex signals (accepted and rejected)")
     v.add_argument("--orders", type=int, nargs="?", const=30, metavar="N", help="last N order reports")
+    v.add_argument("--positions", action="store_true", help="open positions (paper and live) with stop stage")
+    v.add_argument("--trades", type=int, nargs="?", const=30, metavar="N", help="last N closed trades + R statistics")
     return p.parse_args(argv)
 
 
@@ -1143,6 +1215,36 @@ def show_db(path: str, what: str, n: int = 30) -> None:
                 "FROM orders ORDER BY ts DESC LIMIT ?", (n,)):
             print(f"{utc(ts):<18}{coin:<9}{side:<6}{mode:<5}{st:<9}{g(sz, 'g'):>9}{g(bound, '.6g'):>11}{g(ref, '.6g'):>11}"
                   f"{g(filled, 'g'):>9}{g(avg, '.6g'):>11}{g(slip, '+.1f'):>6}{g(stop, '.6g'):>11} {err or ''}")
+    elif what == "positions":
+        print(f"{'OPENED (UTC)':<18}{'COIN':<9}{'MODE':<5}{'SIDE':<6}{'SIZE':>9}{'ENTRY':>11}{'STOP':>11}{'BEST':>11}{'EXC_R':>6}{'STG':>4}{'RISK$':>8}{'STOP_OID':>10}")
+        for coin, mode, side, size, entry, stop, best, d, r_unit, stage, opened, risk, soid in con.execute(
+                "SELECT coin, mode, side, size, entry_px, stop, best_px, direction, r_unit, stage, opened_ms, risk_usd, stop_oid "
+                "FROM positions WHERE status='open' ORDER BY opened_ms"):
+            exc = d * (best - entry) / r_unit if r_unit else 0.0
+            print(f"{utc(opened):<18}{coin:<9}{mode:<5}{side:<6}{size:>9g}{entry:>11.6g}{stop:>11.6g}{best:>11.6g}{exc:>6.2f}{stage:>4}{risk:>8.2f}{g(soid, 'd'):>10}")
+        row = con.execute("SELECT ts, drawdown, halt_until_ms FROM breaker ORDER BY ts DESC LIMIT 1").fetchone()
+        if row:
+            print(f"breaker: last trip {utc(row[0])} dd {row[1]:.1%} halt until {utc(row[2])}")
+    elif what == "trades":
+        print(f"{'CLOSED (UTC)':<18}{'COIN':<9}{'MODE':<5}{'SIDE':<6}{'ENTRY':>11}{'EXIT':>11}{'SIZE':>9}{'R':>7}{'PNL$':>9}{'FEES$':>7}{'STG':>4} REASON")
+        rows_ = con.execute("SELECT closed_ms, coin, mode, side, entry_px, exit_px, size, r_multiple, pnl_usd, fees_usd, stage, reason "
+                            "FROM trades ORDER BY closed_ms DESC LIMIT ?", (n,)).fetchall()
+        for c_ms, coin, mode, side, e, x, size, r, pnl, fees, stage, reason in rows_:
+            print(f"{utc(c_ms):<18}{coin:<9}{mode:<5}{side:<6}{e:>11.6g}{x:>11.6g}{size:>9g}{r:>+7.2f}{pnl:>+9.2f}{fees:>7.2f}{stage:>4} {reason}")
+        for mode, in con.execute("SELECT DISTINCT mode FROM trades"):
+            for leg in ("all", "long", "short"):
+                q = "SELECT r_multiple FROM trades WHERE mode=?" + ("" if leg == "all" else " AND side=?")
+                rs = [r for (r,) in con.execute(q, (mode,) if leg == "all" else (mode, leg))]
+                if not rs:
+                    continue
+                wins, losses = [r for r in rs if r > 0], [-r for r in rs if r <= 0]
+                n_ = len(rs)
+                p = len(wins) / n_
+                mean_r = sum(rs) / n_
+                se_r = math.sqrt(sum((r - mean_r) ** 2 for r in rs) / (n_ - 1) / n_) if n_ > 1 else float("nan")
+                payoff = (sum(wins) / len(wins)) / (sum(losses) / len(losses)) if wins and losses else float("nan")
+                print(f"[{mode} {leg:<5}] n={n_:<4} win rate {p:.2f} ± {math.sqrt(p * (1 - p) / n_):.2f}  "
+                      f"avg R {mean_r:+.3f} ± {se_r:.3f} (SE)  payoff {payoff:.2f}  sum R {sum(rs):+.2f}")
     else:
         row = con.execute("SELECT MAX(ts) FROM scans").fetchone()
         print(f"latest scan {utc(row[0]) if row and row[0] else '—'}")
@@ -1171,11 +1273,14 @@ def build_convex_hook(a: argparse.Namespace, acct: AccountConfig, client: HLInfo
     """ConvexSignalEngine + executor as a scanner hook. Returns None (and logs why) if live was asked for unsafely."""
     from convex_engine import (BreakoutConfig, ConvexExecutor, ConvexRunner, ConvexSignalEngine, ExecConfig,
                                HLGateway, OIHistory)
+    from portfolio import PositionBook
+    from risk_manager import ConvexRiskManager, RiskConfig
     oi = OIHistory()
     if store:
         oi.load(store.oi_history(now_ms() - 6 * HOUR_MS))
     bcfg = BreakoutConfig(allow_shorts=not acct.long_only)
     xcfg = ExecConfig(live=a.live, max_slippage=a.max_slippage_bps / 1e4, max_positions=a.max_positions)
+    rcfg = RiskConfig(bootstrap_risk_frac=a.risk_pct / 100.0, max_risk_frac=a.max_risk_pct / 100.0)
     gateway, address = None, None
     if a.live:
         key = os.environ.get("HL_API_WALLET_KEY")
@@ -1185,15 +1290,20 @@ def build_convex_hook(a: argparse.Namespace, acct: AccountConfig, client: HLInfo
             return None
         gateway = HLGateway(key, master, sub, a.base_url.rstrip("/"))
         address = sub or master
-        log.warning("LIVE EXECUTION ENABLED — trading for %s via API wallet %s · max %d positions · risk %.2f%%/trade · "
+        log.warning("LIVE EXECUTION ENABLED — trading for %s via API wallet %s · max %d positions · risk %.2f%% bootstrap / "
+                    "¼-Kelly ≤ %.1f%% per trade · stop 1.5×ATR14 · breaker %.0f%%/24h → flatten + %dh halt · "
                     "notional ≤ min(%.0fx equity, %.2f%% of 24h volume) · IOC bound %.0f bps · %s",
-                    address, gateway.signer, xcfg.max_positions, acct.risk_pct * 100, acct.max_leverage,
+                    address, gateway.signer, xcfg.max_positions, rcfg.bootstrap_risk_frac * 100, rcfg.max_risk_frac * 100,
+                    rcfg.breaker_dd * 100, int(rcfg.breaker_halt_s // 3600), acct.max_leverage,
                     acct.max_vlm_frac * 100, a.max_slippage_bps, "long only" if acct.long_only else "both sides")
     else:
-        log.info("convex engine in DRY mode: signals and would-be orders are logged and stored, nothing is sent")
-    executor = ConvexExecutor(xcfg, acct, client, store, gateway, address,
-                              notify=telegram.send if telegram else None, limiter=client.limiter)
-    return ConvexRunner(ConvexSignalEngine(bcfg, oi, store), executor).on_cycle
+        log.info("convex engine in DRY mode: paper fills at the IOC bound, exits by the risk manager, nothing is sent")
+    notify = telegram.send if telegram else None
+    risk = ConvexRiskManager(rcfg)
+    book = PositionBook(risk, acct, client, store, gateway, address, live=a.live, notify=notify, limiter=client.limiter)
+    executor = ConvexExecutor(xcfg, acct, client, store, gateway, address, notify=notify, limiter=client.limiter,
+                              risk=risk, book=book)
+    return ConvexRunner(ConvexSignalEngine(bcfg, oi, store), executor, book)
 
 
 async def run(a: argparse.Namespace) -> None:
@@ -1216,12 +1326,13 @@ async def run(a: argparse.Namespace) -> None:
                           ucfg, scfg, fcfg, top=a.top, quiet=a.quiet,
                           coins=[c.strip().upper() for c in a.coins.split(",") if c.strip()] or None)
         if a.convex or a.live:
-            hook = build_convex_hook(a, acct, client, store, telegram)
-            if hook is None:
+            runner = build_convex_hook(a, acct, client, store, telegram)
+            if runner is None:
                 if store:
                     store.close()
                 return
-            scanner.hooks.append(hook)
+            scanner.hooks.append(runner.on_cycle)
+            scanner.extra_coins = runner.position_coins
 
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -1253,7 +1364,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     a = parse_args(argv)
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S", stream=sys.stderr)
-    views = {"events": a.events, "signals": a.signals, "orders": a.orders, "scans": a.top if a.scans else None}
+    views = {"events": a.events, "signals": a.signals, "orders": a.orders, "scans": a.top if a.scans else None,
+             "positions": 0 if a.positions else None, "trades": a.trades}
     wanted = [k for k, v in views.items() if v is not None]
     if wanted:
         if not a.db or not os.path.exists(a.db):

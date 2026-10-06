@@ -1,6 +1,6 @@
 # s38-squeeze — Hyperliquid BB/KC squeeze + funding-fuel scanner (read-only, no orders).
 PY := $(shell [ -x .venv/bin/python3 ] && echo .venv/bin/python3 || echo python3)
-.PHONY: help setup test once run events scans signals orders
+.PHONY: help setup test once run events scans signals orders positions trades
 
 help:
 	@echo "  make setup    venv + requirements"
@@ -11,6 +11,8 @@ help:
 	@echo "  make scans    latest scan rows ranked by score"
 	@echo "  make signals  convex signals and rejections (why a breakout did not qualify)"
 	@echo "  make orders   order reports: dry plans or live fills, slippage, stops"
+	@echo "  make positions open paper/live positions with stop stage and excursion"
+	@echo "  make trades   closed trades with R net of fees + win rate / avg R / payoff with SE, per leg"
 
 setup:
 	python3 -m venv .venv && . .venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt
@@ -35,3 +37,9 @@ signals:
 
 orders:
 	@$(PY) squeeze_scanner.py --orders 30
+
+positions:
+	@$(PY) squeeze_scanner.py --positions
+
+trades:
+	@$(PY) squeeze_scanner.py --trades 30

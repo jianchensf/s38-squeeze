@@ -6,21 +6,24 @@ Scanner for mid/low-cap HL perps: finds **Bollinger-inside-Keltner squeezes** on
 that enters only when compression turns into expansion: Donchian breakout + volume anomaly + open-interest inflow,
 executed as a slippage-bounded IOC with a resting stop.
 
-**Dry-run by default.** Without `--live` nothing is ever sent; signals, rejections and would-be orders are logged
-and stored in sqlite so the whole chain can be audited and backtested before any capital is attached.
+**Dry-run by default.** Without `--live` nothing is ever sent; signals, rejections, paper fills and paper exits
+are logged and stored in sqlite so the whole chain — entry filters, sizing, stops, breaker — can be audited on
+the realized paper record before any capital is attached.
 
 ```
 POST /info metaAndAssetCtxs ─► universe filter ─► closed-bar candles (1h, 4h) ─► BB(20,2) vs KC(20,1.5) squeeze
                             └► current funding + 24h fundingHistory ───────────► short-squeeze fuel
 ─► ScanRow per coin ─► StateEngine ─► sinks: stdout table · sqlite · Telegram (optional) · dry-run intents
-                    └► ConvexSignalEngine (Donchian + vol z ≥ 2.5 + OI ≥ +3 %) ─► ConvexExecutor (IOC ± 0.08 %, stop)
+                    └► ConvexSignalEngine (Donchian + vol z ≥ 2.5 + OI ≥ +3 %) ─► ConvexExecutor (IOC ± 0.08 %)
+                       ConvexRiskManager: ¼-Kelly ≤ 4 % · 1.5×ATR14 stop · +2R break-even · +3R Chandelier 2.5×ATR
+                       PositionBook: paper/live positions · stop replacement · 6 %/24 h breaker → flatten, 12 h halt
 ```
 
 ## Run
 
 ```bash
 make setup                 # python3 -m venv .venv && pip install -r requirements.txt
-make test                  # 28 offline tests: indicator math, convex filters, executor vs fake gateway, fake /info server end-to-end
+make test                  # 36 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, fake /info server end-to-end
 make once                  # one cycle, prints the table (first run loads ~2 candle series per coin)
 make once ARGS=--convex    # same, plus the breakout engine in dry mode
 make run ARGS=--convex     # loop every 60s; Ctrl-C to stop
@@ -28,12 +31,13 @@ make run ARGS=--convex     # loop every 60s; Ctrl-C to stop
 ```
 
 Useful flags: `--min-vol/--max-vol` (default 2e6/40e6), `--exclude BTC,ETH,SOL`, `--max-spread-bps 60`,
-`--tfs 1h,4h` (the **first** TF gates the engine and the fuel range test), `--equity 5000 --risk-pct 1`
-(sizing; live reads equity from the account), `--long-only` (default: both sides), `--weight 600` (API budget, see
-below), `--db state/s38.db` (`--db ''` disables), `--coins AAA,BBB` (debug: restrict), `--quiet` (no table, log
-lines only — use under systemd), `--convex` / `--live` / `--max-positions 3` / `--max-slippage-bps 8` (convex
-engine), `--scans` / `--events N` / `--signals N` / `--orders N` (print from the db and exit; also `make scans`,
-`make events`, `make signals`, `make orders`).
+`--tfs 1h,4h` (the **first** TF gates the engine and the fuel range test), `--equity 5000` (dry-mode equity; live
+reads the account), `--risk-pct 1` (bootstrap risk until 20 realized trades) / `--max-risk-pct 4` (Kelly cap),
+`--long-only` (default: both sides), `--weight 600` (API budget, see below), `--db state/s38.db` (`--db ''`
+disables), `--coins AAA,BBB` (debug: restrict), `--quiet` (no table, log lines only — use under systemd),
+`--convex` / `--live` / `--max-positions 3` / `--max-slippage-bps 8` (convex engine), `--scans` / `--events N` /
+`--signals N` / `--orders N` / `--positions` / `--trades N` (print from the db and exit; also the `make` targets of
+the same names).
 
 Optional Telegram (FIRE/ARM events, convex signals and order reports): `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`
 in `.env` (see `env.sample`).
@@ -89,8 +93,8 @@ signal needs all five:
    `oi_history_insufficient`. The engine therefore needs ≥ 1 hour of running before its first OI confirmation.
 5. **Freshness** — evaluated < 15 min after the bar close; a restart cannot fire on an old bar (`stale(...)`).
 
-Stop = breakout-bar low (long) / high (short), at least 1 ATR(20) from the reference price. Shorts are produced
-unless `--long-only`.
+The signal carries ATR(14) and the breakout bar's extreme for reference; the stop actually used is the risk
+manager's 1.5 × ATR(14) from the fill (next section). Shorts are produced unless `--long-only`.
 
 ## Execution protocol (`ConvexExecutor`)
 
@@ -99,26 +103,64 @@ equity and open positions; dry: `--equity` and simulated positions) → fresh mi
 already in position, in cooldown (24 bars after a fill, 1 bar after an unfilled/failed attempt), at
 `--max-positions`, or if price has already fallen back inside the Donchian range → size → send.
 
-- **Sizing**: `size = equity × risk% / |ref − stop|`, notional capped at `min(equity × 5, 0.05 % of 24h volume)`,
-  floored to `szDecimals`, HL $10 minimum (`too_small` otherwise). Leverage is set per coin to
-  `min(5, maxLeverage)` (cross; isolated for `onlyIsolated` assets) before its first order.
+- **Sizing**: from the risk manager — `size = equity × risk_frac / (1.5 × ATR14)`, notional capped at
+  `min(equity × 5, 0.05 % of 24h volume)`, floored to `szDecimals`, HL $10 minimum (`too_small or no edge`
+  otherwise). Leverage is set per coin to `min(5, maxLeverage)` (cross; isolated for `onlyIsolated` assets) before
+  its first order.
 - **Entry**: one **IOC limit** at `mid × (1 + 0.08 %)` for buys / `mid × (1 − 0.08 %)` for sells, rounded *toward*
   the mid under HL's tick rule (≤ 5 significant figures, ≤ 6 − szDecimals decimals). Hyperliquid's "market" order
   is exactly this slippage-bounded IOC. Whatever fills within the bound is kept (`filled` / `partial`); the rest is
   cancelled by the exchange and never chased (`unfilled` ⇒ 1-bar cooldown). Realized slippage vs the reference
   mid is recorded in bps.
 - **Protection**: immediately after a fill, a **reduce-only stop-market** (`trigger … tpsl: sl, isMarket`) for the
-  filled size at the signal stop, worst acceptable price 5 % beyond the trigger. If the stop is rejected the report
-  says `POSITION UNPROTECTED` at CRITICAL level and goes to Telegram.
-- **Dry mode** (default): the exact order payload, sizing and stop are logged and stored with `mode = dry`; no
-  exchange request is made and the SDK is not even imported.
+  filled size at `fill ∓ 1.5 × ATR14`, worst acceptable price 5 % beyond the trigger. If the stop is rejected the
+  report says `POSITION UNPROTECTED` at CRITICAL level and goes to Telegram. The position is then handed to the
+  PositionBook, which owns the exit from there.
+- **Dry mode** (default): the exact order payload, sizing and stop are logged and stored with `mode = dry`; the
+  fill is simulated at the bound and the paper position is managed exactly like a live one; no exchange request
+  is made and the SDK is not even imported.
 - **Live mode**: `--live` plus `HL_API_WALLET_KEY` and `HL_ACCOUNT_ADDRESS` (optionally `HL_SUBACCOUNT_ADDRESS`)
   in the environment, otherwise the process refuses to start. Use an API wallet (agent key, trading-only) for a
   dedicated $1k sub-account, never the account's private key. Startup logs the signer and the address being traded
   (both public); the key is never logged or stored. Orders go through the official `hyperliquid-python-sdk`
   (`Exchange.order`, `Exchange.update_leverage`) in a worker thread; exchange requests are weight 1.
 
-There is no exit management beyond the initial stop yet — that is a later milestone (or hl-trailstop).
+## Risk & portfolio management (`risk_manager.py`, `portfolio.py`)
+
+`ConvexRiskManager` is pure logic; `PositionBook` applies it to every open position once per cycle, in paper
+(dry) and live mode alike. Target profile this is built for: ~35 % win rate at ≥ 4.5:1 payoff — i.e. most trades
+lose small and the book lives off the runners, so the exit logic never takes profit, it only ratchets the stop.
+
+- **Sizing — quarter-Kelly on realized trades.** `f* = p_lb − (1 − p_lb) / b` with `p_lb` the win rate minus one
+  standard error (pessimistic) and `b` = mean winning R / mean losing R, both from the `trades` table of the
+  current mode; risk fraction = `0.25 · f*`, **capped at 4 % of equity** on the initial stop distance, zero when
+  the realized edge is not positive (then nothing is traded). Until **20 trades** exist the bootstrap fraction
+  (`--risk-pct`, default 1 %) is used — seeding Kelly with the *target* profile would size at the cap from day one
+  on an unvalidated edge. The notional caps from before still apply (≤ 5× equity, ≤ 0.05 % of 24h volume).
+  At the target profile the maths gives 3.7 % after 100 trades and hits the 4 % cap after ~300.
+- **Initial invalidation stop: 1.5 × ATR(14)** from the actual fill (not the reference price). R = that distance.
+  The size is chosen so that the stop loses exactly the risk fraction.
+- **Exit ratchet** (stop only ever moves in the trade's favour; evaluated on every new closed bar — the bar's
+  adverse extreme is tested against the *previous* stop before its favourable extreme is credited — and on the
+  live mark between bars):
+  - best excursion ≥ **+2.0R** → stop to **entry + 0.1R** (break-even after taker fees in and out);
+  - best excursion ≥ **+3.0R** → **Chandelier**: `best excursion − 2.5 × ATR(14)` (mirror for shorts),
+    recomputed with the current ATR each cycle, never lowered.
+  Live: when the stop moves ≥ 0.1 % the resting reduce-only stop-market is replaced — new order first, cancel the
+  old one second — so the position is never unprotected. A position that disappears from the account is closed from
+  its `userFillsByTime` fills (fallback: the stop price) and the leftover stop is cancelled.
+- **Circuit breaker — 6 % in 24 h.** Mark-to-market equity (live: `accountValue`; dry: start + realized +
+  unrealized − fees) is sampled every cycle; a drawdown ≥ 6 % from the rolling 24 h peak **flattens every position
+  (reduce-only IOC, 1 % bound), cancels every open order on the account and halts entries for 12 h**. Cancelling the
+  stops without flattening would leave positions naked, hence the flatten. The halt is stored and survives a
+  restart; the equity window restarts from the resume point so the same drawdown cannot re-trip immediately.
+- **Paper mode** fills at the IOC bound, exits at the stop (or the mark when price has already gapped through it)
+  minus 5 bps, charges 4.5 bps taker each side. Trades land in `trades` with R net of fees; `make trades` prints
+  them with win rate ± SE, avg R ± SE and payoff, for all trades and per leg. These are the numbers the Kelly
+  sizing reads.
+
+Interaction worth knowing: at the 4 % cap, two full-size losses inside 24 h (−8 %) trip the breaker — one and a
+half losses is the real daily budget. With the 1 % bootstrap it takes six.
 
 ## Output
 
@@ -126,7 +168,9 @@ Table legend is printed under each table. sqlite tables (`state/s38.db`): `scans
 price, funding, OI in coin units, volume, spread, both TFs' squeeze metrics, fuel, state, score), `events` (every
 state transition, FIRE rows carry the intent JSON), `funding_hourly` (realized hourly prints), `universe`
 (eligibility counts), `signals` (one row per evaluated breakout bar with every filter value, `accepted`, `reasons`),
-`orders` (every execution report: plan, fill, slippage, stop, raw exchange response). Times are UTC ms.
+`orders` (every execution report: plan, fill, slippage, stop, raw exchange response), `positions` (open and closed,
+with stop stage, best excursion, stop oid), `trades` (closed trades: entry, exit, R net of fees, reason),
+`breaker` (trips). Times are UTC ms. Views: `make scans | events | signals | orders | positions | trades`.
 
 ## API budget — read before running on a shared IP
 
@@ -174,19 +218,21 @@ itself; a v1 database gains the `oi` column and the `signals` / `orders` tables 
 - Signal latency = the cycle that follows the hourly close: 1–3 min at 600 weight/min, up to ~7 min at 400 when
   the 1h and 4h refresh coincide. Entries are therefore minutes after the close, never intra-bar.
 - HL has no OI history endpoint; OI confirmation only works from the scanner's own samples (≥ 1 h of uptime).
-- The convex engine's stop is the only exit. No trailing, no take-profit, no time stop yet.
-- Nothing here is a backtest. The squeeze → expansion thesis, the volume/OI filters and the stop placement are all
-  unvalidated on HL mid-caps until the study below is done.
+- Exits are stop-based only (invalidation → break-even → Chandelier). No take-profit by design, no time stop.
+- Paper fills assume the whole size fills at the IOC bound; thin books will do worse live.
+- Nothing here is a backtest. The squeeze → expansion thesis, the volume/OI filters, the stop placement and the
+  35 % / 4.5:1 target profile are all unvalidated on HL mid-caps until the study below is done. Kelly sizing only
+  engages once 20 realized trades exist and switches itself off if the realized edge is not positive.
 
 ## Graduation
 
-1. Run `--convex` in dry mode on hospitality1 and let `signals` / `orders` accumulate. Review with `make signals`
-   and `make orders`: how many breakouts pass each filter, where the dry fills would have been, and what happened
-   after (the `scans` table has mark prices every minute for the forward path).
+1. Run `--convex` in dry mode on hospitality1 and let `signals` / `orders` / `trades` accumulate. Review with
+   `make signals`, `make orders`, `make positions`, `make trades`: how many breakouts pass each filter, where the
+   paper fills were, how the ratchet exited them, and the realized win rate / payoff with standard errors.
 2. **Historical study** (proposed, not started): squeeze releases and Donchian/volume/OI breakouts on the current
    universe from `candleSnapshot` (up to 5000 1h bars ≈ 200 days per coin): forward |return| and signed return at
    4/12/24/48 bars, split by direction, by fuel / no fuel and by 4h confirmation; n, mean, median, SE, skew, hit rate
    per leg against unconditional bars of the same coins. OI cannot be backtested (no history endpoint), so the OI
    filter's marginal value can only be measured live from the dry log.
 3. Only if 1–2 hold up: `--live` on a dedicated $1k sub-account driven by an API wallet, `--max-positions 3`,
-   1 % risk, with exit management added first.
+   1 % bootstrap risk; Kelly takes over from the 21st live trade.
