@@ -85,6 +85,7 @@ class Position:
     sz_decimals: int = 0
     status: str = "open"
     closed_ms: int = 0
+    ref_px: float = 0.0         # reference mid at send time (entry slippage = fill vs this)
 
     @property
     def excursion_R(self) -> float:

@@ -1,6 +1,6 @@
 # s38-squeeze — Hyperliquid BB/KC squeeze + funding-fuel scanner (read-only, no orders).
 PY := $(shell [ -x .venv/bin/python3 ] && echo .venv/bin/python3 || echo python3)
-.PHONY: help setup test once run events scans signals orders positions trades
+.PHONY: help setup test once run events scans signals orders positions trades wfo wfo-apply
 
 help:
 	@echo "  make setup    venv + requirements"
@@ -13,6 +13,8 @@ help:
 	@echo "  make orders   order reports: dry plans or live fills, slippage, stops"
 	@echo "  make positions open paper/live positions with stop stage and excursion"
 	@echo "  make trades   closed trades with R net of fees + win rate / avg R / payoff with SE, per leg"
+	@echo "  make wfo      walk-forward grid report (report only, params untouched) + active params / past runs"
+	@echo "  make wfo-apply same, and write the chosen params (what the weekly timer does)"
 
 setup:
 	python3 -m venv .venv && . .venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt
@@ -43,3 +45,10 @@ positions:
 
 trades:
 	@$(PY) squeeze_scanner.py --trades 30
+
+wfo:
+	$(PY) wfo.py --report-only $(ARGS)
+	@$(PY) squeeze_scanner.py --wfo
+
+wfo-apply:
+	$(PY) wfo.py $(ARGS)

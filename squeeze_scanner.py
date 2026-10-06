@@ -582,6 +582,40 @@ def _run_length(flags: np.ndarray, end: int) -> int:
     return k
 
 
+def squeeze_bands(h: np.ndarray, l: np.ndarray, c: np.ndarray, cfg: SqueezeConfig) -> dict:
+    """Full-series Bollinger / Keltner bands and the squeeze flag. Shared by the scanner and the WFO replay."""
+    n = cfg.length
+    basis = sma(c, n)
+    sd = rolling_std(c, n)
+    bb_u, bb_l = basis + cfg.bb_mult * sd, basis - cfg.bb_mult * sd
+    kc_mid = ema(c, n)
+    atr = sma(true_range(h, l, c), n)
+    kc_u, kc_l = kc_mid + cfg.kc_mult * atr, kc_mid - cfg.kc_mult * atr
+    with np.errstate(invalid="ignore", divide="ignore"):
+        on = (bb_u < kc_u) & (bb_l > kc_l)
+        bbw = (bb_u - bb_l) / basis
+        ratio = (bb_u - bb_l) / (kc_u - kc_l)
+    return {"basis": basis, "bb_u": bb_u, "bb_l": bb_l, "kc_mid": kc_mid, "kc_u": kc_u, "kc_l": kc_l,
+            "atr": atr, "on": on, "bbw": bbw, "ratio": ratio}
+
+
+def squeeze_recency(on: np.ndarray) -> tuple:
+    """Per bar: (bars since the squeeze was last on, length of that run). −1/0 when never on so far."""
+    n = len(on)
+    ago = np.full(n, -1, dtype=int)
+    run = np.zeros(n, dtype=int)
+    last_j, last_run, cur = -1, 0, 0
+    for i in range(n):
+        if on[i]:
+            cur += 1
+            last_j, last_run = i, cur
+        else:
+            cur = 0
+        if last_j >= 0:
+            ago[i], run[i] = i - last_j, last_run
+    return ago, run
+
+
 def compute_squeeze(tf: str, candles: Sequence[Candle], cfg: SqueezeConfig,
                     range_lookback: int) -> Optional[SqueezeMetrics]:
     """BB(20,2) inside KC(20,1.5·ATR) squeeze on closed bars. None if not enough history."""
@@ -592,17 +626,9 @@ def compute_squeeze(tf: str, candles: Sequence[Candle], cfg: SqueezeConfig,
     l = np.array([c.l for c in candles], dtype=float)
     c = np.array([c.c for c in candles], dtype=float)
 
-    basis = sma(c, n)
-    sd = rolling_std(c, n)
-    bb_u, bb_l = basis + cfg.bb_mult * sd, basis - cfg.bb_mult * sd
-    kc_mid = ema(c, n)
-    atr = sma(true_range(h, l, c), n)
-    kc_u, kc_l = kc_mid + cfg.kc_mult * atr, kc_mid - cfg.kc_mult * atr
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        on = (bb_u < kc_u) & (bb_l > kc_l)
-        bbw = (bb_u - bb_l) / basis
-        ratio = (bb_u - bb_l) / (kc_u - kc_l)
+    b = squeeze_bands(h, l, c, cfg)
+    basis, bb_u, bb_l, kc_mid, kc_u, kc_l = b["basis"], b["bb_u"], b["bb_l"], b["kc_mid"], b["kc_u"], b["kc_l"]
+    atr, on, bbw, ratio = b["atr"], b["on"], b["bbw"], b["ratio"]
 
     i = len(c) - 1
     bars = _run_length(on, i)
@@ -914,9 +940,26 @@ class Store:
     CREATE TABLE IF NOT EXISTS trades (
         opened_ms INTEGER, closed_ms INTEGER, coin TEXT, mode TEXT, side TEXT, entry_px REAL, exit_px REAL, size REAL,
         r_unit REAL, pnl_usd REAL, r_multiple REAL, fees_usd REAL, stage INTEGER, reason TEXT,
+        duration_s REAL, entry_slip_bps REAL, exit_slip_bps REAL, funding_usd REAL,
         PRIMARY KEY (coin, mode, opened_ms));
     CREATE TABLE IF NOT EXISTS breaker (ts INTEGER PRIMARY KEY, equity REAL, peak REAL, drawdown REAL, halt_until_ms INTEGER);
+    CREATE TABLE IF NOT EXISTS position_events (
+        ts INTEGER, coin TEXT, mode TEXT, opened_ms INTEGER, kind TEXT, px REAL, stop REAL, stage INTEGER, detail TEXT);
+    CREATE TABLE IF NOT EXISTS params (key TEXT PRIMARY KEY, value REAL, since_ms INTEGER, source TEXT);
+    CREATE TABLE IF NOT EXISTS wfo_runs (
+        ts INTEGER PRIMARY KEY, window_start INTEGER, window_end INTEGER, split_ms INTEGER, n_coins INTEGER,
+        chosen_donchian INTEGER, chosen_trail REAL, adopted INTEGER, verdict TEXT, detail TEXT);
+    CREATE TABLE IF NOT EXISTS candles (coin TEXT, t INTEGER, o REAL, h REAL, l REAL, c REAL, v REAL, PRIMARY KEY (coin, t));
     """
+
+    MIGRATIONS = (
+        ("scans", "oi", "REAL"),                    # v1 → OI in coin units for the convex engine
+        ("trades", "duration_s", "REAL"),           # v3 → trade-log enrichment for the WFO module
+        ("trades", "entry_slip_bps", "REAL"),
+        ("trades", "exit_slip_bps", "REAL"),
+        ("trades", "funding_usd", "REAL"),
+        ("positions", "ref_px", "REAL"),
+    )
 
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -926,10 +969,11 @@ class Store:
         self._migrate()
 
     def _migrate(self) -> None:
-        cols = {r[1] for r in self.con.execute("PRAGMA table_info(scans)")}
-        if "oi" not in cols:                       # v1 databases: OI in coin units was added for the convex engine
-            self.con.execute("ALTER TABLE scans ADD COLUMN oi REAL")
-            self.con.commit()
+        for table, col, decl in self.MIGRATIONS:
+            cols = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        self.con.commit()
 
     def last_fire_bars(self) -> dict:
         cur = self.con.execute("SELECT coin, MAX(bar_time) FROM events WHERE kind='FIRE' GROUP BY coin")
@@ -992,7 +1036,7 @@ class Store:
     # ── risk manager / position book ──
     POS_COLS = ("coin", "mode", "opened_ms", "side", "direction", "entry_px", "size", "initial_stop", "stop", "r_unit",
                 "best_px", "stage", "entry_bar", "last_bar_checked", "stop_oid", "risk_usd", "notional", "fees_usd",
-                "sz_decimals", "status", "closed_ms")
+                "sz_decimals", "status", "closed_ms", "ref_px")
 
     def upsert_position(self, p: Any) -> None:
         self.con.execute(f"INSERT OR REPLACE INTO positions ({','.join(self.POS_COLS)}) VALUES ({','.join('?' * len(self.POS_COLS))})",
@@ -1004,12 +1048,77 @@ class Store:
         cur = self.con.execute(f"SELECT {','.join(self.POS_COLS)} FROM positions WHERE mode=? AND status='open'", (mode,))
         return [Position(**dict(zip(self.POS_COLS, row))) for row in cur.fetchall()]
 
+    TRADE_COLS = ("opened_ms", "closed_ms", "coin", "mode", "side", "entry_px", "exit_px", "size", "r_unit", "pnl_usd",
+                  "r_multiple", "fees_usd", "stage", "reason", "duration_s", "entry_slip_bps", "exit_slip_bps", "funding_usd")
+
     def write_trade(self, t: dict) -> None:
-        cols = ("opened_ms", "closed_ms", "coin", "mode", "side", "entry_px", "exit_px", "size", "r_unit", "pnl_usd",
-                "r_multiple", "fees_usd", "stage", "reason")
-        self.con.execute(f"INSERT OR REPLACE INTO trades ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-                         tuple(t[c] for c in cols))
+        self.con.execute(f"INSERT OR REPLACE INTO trades ({','.join(self.TRADE_COLS)}) VALUES ({','.join('?' * len(self.TRADE_COLS))})",
+                         tuple(t.get(c) for c in self.TRADE_COLS))
         self.con.commit()
+
+    def trades(self, mode: str, since_ms: int = 0) -> list:
+        cur = self.con.execute(f"SELECT {','.join(self.TRADE_COLS)} FROM trades WHERE mode=? AND closed_ms>=? ORDER BY closed_ms",
+                               (mode, since_ms))
+        return [dict(zip(self.TRADE_COLS, row)) for row in cur.fetchall()]
+
+    def write_position_event(self, ts: int, coin: str, mode: str, opened_ms: int, kind: str, px: float,
+                             stop: float, stage: int, detail: str = "") -> None:
+        self.con.execute("INSERT INTO position_events VALUES (?,?,?,?,?,?,?,?,?)",
+                         (ts, coin, mode, opened_ms, kind, px, stop, stage, detail))
+        self.con.commit()
+
+    def funding_between(self, coin: str, start_ms: int, end_ms: int) -> list:
+        """Realized hourly funding prints (time, rate) for a coin inside [start, end]."""
+        return self.con.execute("SELECT time, rate FROM funding_hourly WHERE coin=? AND time>=? AND time<=? ORDER BY time",
+                                (coin, start_ms, end_ms)).fetchall()
+
+    # ── parameters (written by the WFO job, read by the running scanner) ──
+    DEFAULT_PARAMS = {"donchian_len": 20.0, "trail_atr_mult": 2.5}
+
+    def active_params(self) -> dict:
+        out = dict(self.DEFAULT_PARAMS)
+        for key, value in self.con.execute("SELECT key, value FROM params"):
+            if key in out:
+                out[key] = float(value)
+        return out
+
+    def set_params(self, values: dict, source: str, ts: int) -> None:
+        self.con.executemany("INSERT OR REPLACE INTO params VALUES (?,?,?,?)",
+                             [(k, float(v), ts, source) for k, v in values.items()])
+        self.con.commit()
+
+    def write_wfo_run(self, r: dict) -> None:
+        self.con.execute("INSERT OR REPLACE INTO wfo_runs VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         (r["ts"], r["window_start"], r["window_end"], r["split_ms"], r["n_coins"], r["chosen_donchian"],
+                          r["chosen_trail"], int(r["adopted"]), r["verdict"], json.dumps(r["detail"])))
+        self.con.commit()
+
+    # ── history for the replay ──
+    def write_candles(self, coin: str, candles: Sequence[Candle]) -> None:
+        self.con.executemany("INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?)",
+                             [(coin, c.t, c.o, c.h, c.l, c.c, c.v) for c in candles])
+        self.con.commit()
+
+    def read_candles(self, coin: str, start_ms: int, end_ms: int) -> list:
+        rows = self.con.execute("SELECT t, o, h, l, c, v FROM candles WHERE coin=? AND t>=? AND t<=? ORDER BY t",
+                                (coin, start_ms, end_ms)).fetchall()
+        return [Candle(t, t + HOUR_MS - 1, o, h, l, c, v, 0) for t, o, h, l, c, v in rows]
+
+    def eligibility(self, start_ms: int, end_ms: int) -> dict:
+        """coin -> set of hour-open ms during which the coin was in the scanned universe (one scan row per cycle)."""
+        out: dict = {}
+        for coin, hour in self.con.execute(
+                "SELECT DISTINCT coin, (ts / 3600000) * 3600000 FROM scans WHERE ts>=? AND ts<=?", (start_ms, end_ms)):
+            out.setdefault(coin, set()).add(int(hour))
+        return out
+
+    def oi_samples(self, coin: str, start_ms: int, end_ms: int) -> list:
+        return self.con.execute("SELECT ts, oi FROM scans WHERE coin=? AND ts>=? AND ts<=? AND oi IS NOT NULL ORDER BY ts",
+                                (coin, start_ms, end_ms)).fetchall()
+
+    def logged_span(self) -> tuple:
+        row = self.con.execute("SELECT MIN(ts), MAX(ts) FROM scans").fetchone()
+        return (int(row[0]), int(row[1])) if row and row[0] else (0, 0)
 
     def trade_r_multiples(self, mode: str) -> list:
         return [r for (r,) in self.con.execute("SELECT r_multiple FROM trades WHERE mode=? ORDER BY closed_ms", (mode,))]
@@ -1121,8 +1230,9 @@ class Scanner:
             if sq:
                 squeezes[a.coin] = sq
 
-        # Realized funding history only for coins currently in a squeeze — that is where fuel matters.
-        await self.funding.refresh([c for c, sq in squeezes.items() if any(m.squeeze_on for m in sq.values())], t_ms)
+        # Realized funding history for coins in a squeeze (fuel) and for coins with an open position (trade funding).
+        await self.funding.refresh(sorted({c for c, sq in squeezes.items() if any(m.squeeze_on for m in sq.values())}
+                                          | set(self.extra_coins())), t_ms)
 
         rows = []
         for a in eligible:
@@ -1188,6 +1298,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     v.add_argument("--orders", type=int, nargs="?", const=30, metavar="N", help="last N order reports")
     v.add_argument("--positions", action="store_true", help="open positions (paper and live) with stop stage")
     v.add_argument("--trades", type=int, nargs="?", const=30, metavar="N", help="last N closed trades + R statistics")
+    v.add_argument("--wfo", action="store_true", help="active parameters and the last walk-forward runs")
     return p.parse_args(argv)
 
 
@@ -1225,6 +1336,15 @@ def show_db(path: str, what: str, n: int = 30) -> None:
         row = con.execute("SELECT ts, drawdown, halt_until_ms FROM breaker ORDER BY ts DESC LIMIT 1").fetchone()
         if row:
             print(f"breaker: last trip {utc(row[0])} dd {row[1]:.1%} halt until {utc(row[2])}")
+    elif what == "wfo":
+        for key, value, since, source in con.execute("SELECT key, value, since_ms, source FROM params ORDER BY key"):
+            print(f"param {key} = {value:g}  (since {utc(since)}; {source[:90]})")
+        if not con.execute("SELECT 1 FROM params").fetchone():
+            print("params: defaults (donchian_len 20, trail_atr_mult 2.5) — no WFO run has written anything yet")
+        print(f"{'RUN (UTC)':<18}{'WINDOW':<30}{'COINS':>6}{'CHOSEN':>12} ADOPTED VERDICT")
+        for ts, ws, we, n, L, m, ad, verdict in con.execute(
+                "SELECT ts, window_start, window_end, n_coins, chosen_donchian, chosen_trail, adopted, verdict FROM wfo_runs ORDER BY ts DESC LIMIT 10"):
+            print(f"{utc(ts):<18}{utc(ws)[:10] + ' → ' + utc(we)[:10]:<30}{n:>6}{f'({L}, {m:g})':>12} {'yes' if ad else 'no':<7} {verdict}")
     elif what == "trades":
         print(f"{'CLOSED (UTC)':<18}{'COIN':<9}{'MODE':<5}{'SIDE':<6}{'ENTRY':>11}{'EXIT':>11}{'SIZE':>9}{'R':>7}{'PNL$':>9}{'FEES$':>7}{'STG':>4} REASON")
         rows_ = con.execute("SELECT closed_ms, coin, mode, side, entry_px, exit_px, size, r_multiple, pnl_usd, fees_usd, stage, reason "
@@ -1303,7 +1423,7 @@ def build_convex_hook(a: argparse.Namespace, acct: AccountConfig, client: HLInfo
     book = PositionBook(risk, acct, client, store, gateway, address, live=a.live, notify=notify, limiter=client.limiter)
     executor = ConvexExecutor(xcfg, acct, client, store, gateway, address, notify=notify, limiter=client.limiter,
                               risk=risk, book=book)
-    return ConvexRunner(ConvexSignalEngine(bcfg, oi, store), executor, book)
+    return ConvexRunner(ConvexSignalEngine(bcfg, oi, store), executor, book, store)
 
 
 async def run(a: argparse.Namespace) -> None:
@@ -1365,7 +1485,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S", stream=sys.stderr)
     views = {"events": a.events, "signals": a.signals, "orders": a.orders, "scans": a.top if a.scans else None,
-             "positions": 0 if a.positions else None, "trades": a.trades}
+             "positions": 0 if a.positions else None, "trades": a.trades, "wfo": 0 if a.wfo else None}
     wanted = [k for k, v in views.items() if v is not None]
     if wanted:
         if not a.db or not os.path.exists(a.db):

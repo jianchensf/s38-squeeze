@@ -1,0 +1,10 @@
+[Unit]
+Description=s38-squeeze walk-forward optimisation, weekly
+
+[Timer]
+# Mondays 00:40 UTC (after the 00:00 bar close and the scanner's 4h refresh, before the 01:00 close)
+OnCalendar=Mon *-*-* 00:40:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

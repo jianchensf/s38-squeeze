@@ -17,13 +17,15 @@ POST /info metaAndAssetCtxs ─► universe filter ─► closed-bar candles (1h
                     └► ConvexSignalEngine (Donchian + vol z ≥ 2.5 + OI ≥ +3 %) ─► ConvexExecutor (IOC ± 0.08 %)
                        ConvexRiskManager: ¼-Kelly ≤ 4 % · 1.5×ATR14 stop · +2R break-even · +3R Chandelier 2.5×ATR
                        PositionBook: paper/live positions · stop replacement · 6 %/24 h breaker → flatten, 12 h halt
+weekly wfo.py: replay of the logged window over Donchian 16–32 × Chandelier 2.0–3.2 ─► WFE > 0.7 & OOS DD < 10 % gate
+               ─► params table (else baseline 20 / 2.5) ─► scanner re-reads every cycle
 ```
 
 ## Run
 
 ```bash
 make setup                 # python3 -m venv .venv && pip install -r requirements.txt
-make test                  # 36 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, fake /info server end-to-end
+make test                  # 42 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
 make once                  # one cycle, prints the table (first run loads ~2 candle series per coin)
 make once ARGS=--convex    # same, plus the breakout engine in dry mode
 make run ARGS=--convex     # loop every 60s; Ctrl-C to stop
@@ -36,8 +38,8 @@ reads the account), `--risk-pct 1` (bootstrap risk until 20 realized trades) / `
 `--long-only` (default: both sides), `--weight 600` (API budget, see below), `--db state/s38.db` (`--db ''`
 disables), `--coins AAA,BBB` (debug: restrict), `--quiet` (no table, log lines only — use under systemd),
 `--convex` / `--live` / `--max-positions 3` / `--max-slippage-bps 8` (convex engine), `--scans` / `--events N` /
-`--signals N` / `--orders N` / `--positions` / `--trades N` (print from the db and exit; also the `make` targets of
-the same names).
+`--signals N` / `--orders N` / `--positions` / `--trades N` / `--wfo` (print from the db and exit; also the `make`
+targets of the same names).
 
 Optional Telegram (FIRE/ARM events, convex signals and order reports): `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`
 in `.env` (see `env.sample`).
@@ -162,6 +164,39 @@ lose small and the book lives off the runners, so the exit logic never takes pro
 Interaction worth knowing: at the 4 % cap, two full-size losses inside 24 h (−8 %) trip the breaker — one and a
 half losses is the real daily budget. With the 1 % bootstrap it takes six.
 
+## Trade log & walk-forward optimisation (`wfo.py`, weekly timer)
+
+**Trade log.** Every lifecycle event is written as it happens: `position_events` (open, each stop move with old →
+new level and stage, close), `positions` (current state), `trades` (entry, exit, size, duration, entry slippage
+vs the reference mid, exit slippage vs the stop, fees, hourly funding paid/received while open from the realized
+prints, R net of all of it, exit reason). `make trades` prints the realized statistics.
+
+**Why a replay.** A parameter scan over the Donchian lookback and the Chandelier multiplier cannot be read off the
+trade log — a different lookback produces different entries, a different multiplier different exits. `wfo.py`
+therefore **replays the live logic** over the logged window, using the log for what it can supply: which coins were
+in the universe at each hour (no survivorship bias), the OI samples (HL has no OI history; bars without samples fail
+the OI test exactly as live), realized funding, and the realized fee/slippage costs once ≥ 10 trades exist. Entries
+use the same filters as `ConvexSignalEngine`, exits call `ConvexRiskManager` itself, so the two cannot drift; every
+run also **reconciles** the replay under the live parameters against the logged trades and prints how many it
+reproduced.
+
+**Grid and gate.** Donchian 16–32 (step 2) × Chandelier 2.0–3.2 (step 0.2, plus the 2.5 baseline) = 72 points,
+each replayed over the last 30 logged days with portfolio limits (3 positions, 24-bar cooldown) but without the
+breaker (a kill switch is not a parameter). Trades belong to in-sample (first 20 days) or out-of-sample (last 10)
+by entry time. Sharpe is annualised from daily R sums (days without trades = 0) with its standard error; max
+drawdown compounds the book's current risk fraction per trade. A non-baseline point is adopted only if **all** of:
+`n_IS ≥ 30`, `n_OOS ≥ 10`, `Sharpe_IS > 0`, **WFE = Sharpe_OOS / Sharpe_IS > 0.70**, **OOS max drawdown < 10 %**,
+and its OOS Sharpe is not below the baseline's. Otherwise the **baseline (20, 2.5)** is (re)installed — a degraded
+regime therefore falls back by construction. Picking the best of 72 points inflates the in-sample number, which is
+why the WFE gate exists and why the report shows the standard errors.
+
+**Mechanics.** `deploy/s38-wfo.timer` runs `wfo.py` Mondays 00:40 UTC; the verdict and the full grid go to
+`wfo_runs`, the chosen values to `params`, and the running scanner re-reads `params` every cycle (open positions
+keep ratcheting with the new multiplier; the stop never moves against them). `make wfo` prints the same report
+without touching anything; `make wfo-apply` is what the timer does. Until ~30 days and ≥ 30 in-sample trades are
+logged the job says so and stays at baseline — at the signal rate observed on day one that is months away, which is
+itself a finding.
+
 ## Output
 
 Table legend is printed under each table. sqlite tables (`state/s38.db`): `scans` (one row per coin per cycle:
@@ -169,8 +204,10 @@ price, funding, OI in coin units, volume, spread, both TFs' squeeze metrics, fue
 state transition, FIRE rows carry the intent JSON), `funding_hourly` (realized hourly prints), `universe`
 (eligibility counts), `signals` (one row per evaluated breakout bar with every filter value, `accepted`, `reasons`),
 `orders` (every execution report: plan, fill, slippage, stop, raw exchange response), `positions` (open and closed,
-with stop stage, best excursion, stop oid), `trades` (closed trades: entry, exit, R net of fees, reason),
-`breaker` (trips). Times are UTC ms. Views: `make scans | events | signals | orders | positions | trades`.
+with stop stage, best excursion, stop oid), `position_events` (open / stop_move / close as they happen), `trades`
+(closed trades: entry, exit, duration, slippage, fees, funding, R net, reason), `breaker` (trips), `params` (active
+WFO-tuned values), `wfo_runs` (every weekly run with its full grid), `candles` (1h cache for the replay). Times are
+UTC ms. Views: `make scans | events | signals | orders | positions | trades | wfo`.
 
 ## API budget — read before running on a shared IP
 
@@ -208,7 +245,7 @@ python3 squeeze_scanner.py --orders     # order reports (dry or live)   make ord
 ```
 
 Upgrade: `git pull && bash deploy/install_on_box.sh && systemctl restart s38-squeeze` (the sqlite schema migrates
-itself; a v1 database gains the `oi` column and the `signals` / `orders` tables on first start).
+itself on first start; the installer also enables the weekly `s38-wfo.timer` — `systemctl list-timers s38-wfo.timer`).
 
 ## Known limits
 

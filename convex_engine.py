@@ -489,7 +489,7 @@ class ConvexExecutor:
             self._cooldown[plan.coin] = t_ms + self.cfg.cooldown_bars * HOUR_MS
             if self.book is not None:
                 self.book.register(plan.coin, 1 if plan.is_buy else -1, plan.bound_px, plan.sz, plan.atr, t_ms,
-                                   plan.entry_bar, plan.sz_decimals, None, plan.notional)
+                                   plan.entry_bar, plan.sz_decimals, None, plan.notional, plan.ref_px)
             log.warning("DRY %s %s %g @ %g (ref %g) notional $%.0f risk $%.2f stop %g [%s] — would send %s",
                         plan.side.upper(), plan.coin, plan.sz, plan.bound_px, plan.ref_px, plan.notional,
                         plan.risk_usd, rep.stop_px, plan.size_note, rep.raw)
@@ -539,7 +539,7 @@ class ConvexExecutor:
                 log.critical("%s %s: %s", plan.coin, plan.side, rep.error)
             if self.book is not None:
                 self.book.register(plan.coin, 1 if plan.is_buy else -1, avg, filled, plan.atr, t_ms, plan.entry_bar,
-                                   plan.sz_decimals, rep.stop_oid, filled * avg)
+                                   plan.sz_decimals, rep.stop_oid, filled * avg, plan.ref_px)
         else:
             rep.status = status if status in ("unfilled", "error") else "error"
             self._cooldown[plan.coin] = t_ms + self.cfg.cooldown_bars_unfilled * HOUR_MS
@@ -564,13 +564,32 @@ def format_report(rep: ExecutionReport) -> str:
 class ConvexRunner:
     """Scanner cycle hook: manage open positions (book) → evaluate → execute → one summary line."""
 
-    def __init__(self, engine: ConvexSignalEngine, executor: ConvexExecutor, book: Any = None):
-        self.engine, self.executor, self.book = engine, executor, book
+    def __init__(self, engine: ConvexSignalEngine, executor: ConvexExecutor, book: Any = None, store: Any = None):
+        self.engine, self.executor, self.book, self.store = engine, executor, book, store
+        self.params: dict = {}
 
     def position_coins(self) -> set:
         return set(self.book.positions) if self.book is not None else set()
 
+    def apply_params(self, params: dict) -> None:
+        """Hot-reload of the two WFO-tuned parameters (written to the params table by wfo.py)."""
+        from dataclasses import replace
+        L, m = int(params["donchian_len"]), float(params["trail_atr_mult"])
+        if self.engine.cfg.donchian_len != L:
+            self.engine.cfg = replace(self.engine.cfg, donchian_len=L)
+        if self.executor.risk.cfg.trail_atr_mult != m:
+            self.executor.risk.cfg = replace(self.executor.risk.cfg, trail_atr_mult=m)
+        if self.params and self.params != params:
+            log.warning("parameters updated by WFO: donchian_len %s → %d, trail_atr_mult %s → %g",
+                        self.params.get("donchian_len"), L, self.params.get("trail_atr_mult"), m)
+        self.params = dict(params)
+
     async def on_cycle(self, rows: Sequence[ScanRow], candles: dict, t_ms: int, ctx_all: Optional[dict] = None) -> None:
+        if self.store is not None:
+            try:
+                self.apply_params(self.store.active_params())
+            except Exception:
+                log.exception("params reload failed")
         signals = self.engine.evaluate(rows, candles, t_ms)
         mids = None
         if self.book is not None and (self.book.positions or signals):

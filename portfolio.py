@@ -30,7 +30,7 @@ class PositionBook:
     def __init__(self, risk: ConvexRiskManager, acct: AccountConfig, info: Any, store: Any = None,
                  gateway: Any = None, account_address: Optional[str] = None, live: bool = False,
                  notify: Optional[Callable[[str], Awaitable[None]]] = None, limiter: Any = None, tf: str = "1h"):
-        self.risk, self.cfg, self.acct, self.info, self.store = risk, risk.cfg, acct, info, store
+        self.risk, self.acct, self.info, self.store = risk, acct, info, store
         self.gateway, self.address, self.live, self.notify, self.limiter, self.tf = gateway, account_address, live, notify, limiter, tf
         self.mode = "live" if live else "dry"
         self.positions: dict = {}
@@ -51,9 +51,18 @@ class PositionBook:
         if state and state.halt_until_ms:
             log.warning("breaker state restored: halted until %s", utc(state.halt_until_ms))
 
+    @property
+    def cfg(self):
+        return self.risk.cfg          # always the risk manager's current config (the WFO job may replace it)
+
     # ── queries ──
     def stats(self) -> TradeStats:
         return stats_from_r_multiples(self._r_multiples)
+
+    def _event(self, pos: Position, kind: str, px: float, detail: str = "", ts: Optional[int] = None) -> None:
+        if self.store:
+            self.store.write_position_event(ts or pos.closed_ms or pos.opened_ms, pos.coin, self.mode, pos.opened_ms,
+                                            kind, px, pos.stop, pos.stage, detail)
 
     def can_enter(self, t_ms: int) -> tuple:
         if self.breaker.halted(t_ms):
@@ -66,37 +75,55 @@ class PositionBook:
 
     # ── lifecycle ──
     def register(self, coin: str, direction: int, fill_px: float, size: float, atr: float, t_ms: int, entry_bar: int,
-                 sz_decimals: int, stop_oid: Optional[int] = None, notional: float = 0.0) -> Position:
+                 sz_decimals: int, stop_oid: Optional[int] = None, notional: float = 0.0, ref_px: float = 0.0) -> Position:
         r_unit = self.cfg.stop_atr_mult * atr
         stop = self.risk.initial_stop(fill_px, direction, atr)
         pos = Position(coin=coin, side="long" if direction > 0 else "short", direction=direction, entry_px=fill_px,
                        size=size, initial_stop=stop, stop=stop, r_unit=r_unit, best_px=fill_px, stage=0, opened_ms=t_ms,
                        entry_bar=entry_bar, last_bar_checked=entry_bar, stop_oid=stop_oid, mode=self.mode,
                        risk_usd=round(size * r_unit, 2), notional=round(notional or size * fill_px, 2),
-                       fees_usd=round(size * fill_px * self.cfg.taker_fee, 4), sz_decimals=sz_decimals)
+                       fees_usd=round(size * fill_px * self.cfg.taker_fee, 4), sz_decimals=sz_decimals, ref_px=ref_px or fill_px)
         self.positions[coin] = pos
         if self.store:
             self.store.upsert_position(pos)
+        self._event(pos, "open", fill_px, f"size {size:g} atr {atr:g} stop_oid {stop_oid}", t_ms)
         log.warning("BOOK open %s %s %g @ %g stop %g (R %g/unit, risk $%.2f) [%s]", pos.side, coin, size, fill_px,
                     stop, r_unit, pos.risk_usd, self.mode)
         return pos
 
+    def _funding_usd(self, pos: Position, t_ms: int) -> Optional[float]:
+        """Σ hourly funding paid (−) / received (+) while open, from realized prints; None when nothing is logged."""
+        if not self.store:
+            return None
+        prints = self.store.funding_between(pos.coin, pos.opened_ms, t_ms)
+        if not prints:
+            return None
+        return -pos.direction * pos.size * pos.entry_px * sum(rate for _, rate in prints)
+
     def _close(self, pos: Position, exit_px: float, t_ms: int, reason: str, exit_fee_usd: Optional[float] = None) -> dict:
         exit_fee = pos.size * exit_px * self.cfg.taker_fee if exit_fee_usd is None else exit_fee_usd
         fees = pos.fees_usd + exit_fee
-        pnl = pos.pnl_usd(exit_px) - fees
+        funding = self._funding_usd(pos, t_ms)
+        pnl = pos.pnl_usd(exit_px) - fees + (funding or 0.0)
         r = pnl / (pos.size * pos.r_unit) if pos.size * pos.r_unit > 0 else 0.0
         pos.status, pos.closed_ms, pos.fees_usd = "closed", t_ms, round(fees, 4)
         self.positions.pop(pos.coin, None)
         self.realized_usd += pnl
         self._r_multiples.append(r)
+        entry_slip = pos.direction * (pos.entry_px / pos.ref_px - 1.0) * 1e4 if pos.ref_px else None
+        exit_ref = pos.stop if reason.startswith("stop") else None
+        exit_slip = -pos.direction * (exit_px / exit_ref - 1.0) * 1e4 if exit_ref else None
         trade = {"opened_ms": pos.opened_ms, "closed_ms": t_ms, "coin": pos.coin, "mode": self.mode, "side": pos.side,
                  "entry_px": pos.entry_px, "exit_px": exit_px, "size": pos.size, "r_unit": pos.r_unit,
                  "pnl_usd": round(pnl, 4), "r_multiple": round(r, 4), "fees_usd": round(fees, 4), "stage": pos.stage,
-                 "reason": reason}
+                 "reason": reason, "duration_s": (t_ms - pos.opened_ms) / 1000.0,
+                 "entry_slip_bps": None if entry_slip is None else round(entry_slip, 2),
+                 "exit_slip_bps": None if exit_slip is None else round(exit_slip, 2),
+                 "funding_usd": None if funding is None else round(funding, 4)}
         if self.store:
             self.store.upsert_position(pos)
             self.store.write_trade(trade)
+        self._event(pos, "close", exit_px, reason, t_ms)
         log.warning("BOOK close %s %s @ %g: %+.2fR $%+.2f (%s) [%s]", pos.side, pos.coin, exit_px, r, pnl, reason, self.mode)
         return trade
 
@@ -265,6 +292,10 @@ class PositionBook:
                 pos.stop = old_stop                      # only adopt the new level once the exchange holds it
                 if await self._replace_stop(pos, new):
                     moved += 1
+            elif not self.live and pos.stop != old_stop:
+                moved += 1
+            if pos.stop != old_stop:
+                self._event(pos, "stop_move", mark or pos.best_px, f"{old_stop:g} → {pos.stop:g} (stage {pos.stage})", t_ms)
             if self.store:
                 self.store.upsert_position(pos)
         if not self.live:

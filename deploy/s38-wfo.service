@@ -1,0 +1,18 @@
+# Weekly walk-forward optimisation (started by s38-wfo.timer). Replays the last 30 logged days over the
+# Donchian × Chandelier grid, writes wfo_runs and — only if the anti-overfitting gate passes — the params table,
+# which the running scanner re-reads every cycle. Baseline (20, 2.5) otherwise. Report: journalctl -u s38-wfo
+[Unit]
+Description=s38-squeeze weekly walk-forward optimisation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/dev/s38-squeeze
+ExecStart=/usr/bin/python3 /home/dev/s38-squeeze/wfo.py --weight 300
+EnvironmentFile=-/home/dev/s38-squeeze/.env
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=s38-wfo

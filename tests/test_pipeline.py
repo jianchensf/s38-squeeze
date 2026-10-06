@@ -162,7 +162,7 @@ def test_end_to_end_pipeline(tmp_path, capsys):
     assert bars[-1].t == last_closed_open_time("1h", rows1[0].ts)
     assert calls1["candleSnapshot"] == 8 and calls2["candleSnapshot"] == 8
     assert calls2["metaAndAssetCtxs"] == 2
-    assert calls1["fundingHistory"] >= 1 and calls2["fundingHistory"] == calls1["fundingHistory"]
+    assert calls1["fundingHistory"] >= 1 and calls2["fundingHistory"] == calls1["fundingHistory"] + 1   # +1: KKK's open position
 
     # convex engine: KKK has squeeze + Donchian break + volume spike + OI +4% → one dry order;
     # GGG breaks out on flat volume → rejected; the same bars are not re-evaluated on cycle 2
