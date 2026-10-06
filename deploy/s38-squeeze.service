@@ -1,0 +1,23 @@
+# hospitality1 unit (same layout as s35-pullback: code in /home/dev, runs as root under systemd).
+# Install with deploy/install_on_box.sh. Logs: journalctl -u s38-squeeze -f
+# --weight 400 leaves two thirds of HL's 1200/min per-IP budget to the live s16 book on this box. Do not raise it.
+[Unit]
+Description=s38-squeeze — Hyperliquid BB/KC squeeze + funding-fuel scanner (read-only, no orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dev/s38-squeeze
+ExecStart=/usr/bin/python3 /home/dev/s38-squeeze/squeeze_scanner.py --interval 60 --weight 400 --quiet
+EnvironmentFile=-/home/dev/s38-squeeze/.env
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=15
+MemoryMax=300M
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=s38-squeeze
+
+[Install]
+WantedBy=multi-user.target
