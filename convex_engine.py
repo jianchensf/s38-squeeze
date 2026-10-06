@@ -50,8 +50,10 @@ class BreakoutConfig:
     oi_min_change: float = 0.03     # OI(bar close) / OI(bar open) − 1
     oi_tolerance_s: float = 300.0   # an OI sample must sit within ±5 min of the bar open
     require_squeeze: bool = True
-    min_squeeze_bars: int = 3
-    max_bars_since_squeeze: int = 2
+    compression_tfs: tuple = ("1h", "4h")   # a squeeze on ANY of these satisfies the compression precondition
+    min_squeeze_bars: int = 3               # … if it held at least this many of that timeframe's bars
+    max_bars_since_squeeze: int = 2         # … and ended at most this many of that timeframe's bars ago
+    require_oi: bool = True                 # False only for historical studies (HL has no OI history)
     allow_shorts: bool = True
     stop_atr_min: float = 1.0       # stop = breakout-bar extreme, at least this many ATR away
     max_signal_age_s: float = 900.0 # bar must have closed less than this long ago (a full candle refresh at
@@ -158,6 +160,23 @@ class ConvexSignal:
     bars_since_squeeze: int
     atr: float
     stop_px: float
+    squeeze_tf: str = "1h"      # timeframe whose squeeze satisfied the compression precondition
+
+
+def compression_check(squeeze: dict, cfg: BreakoutConfig) -> tuple:
+    """→ (ok, tf, run, ago, note). First timeframe in cfg.compression_tfs whose squeeze qualifies wins."""
+    parts = []
+    for tf in cfg.compression_tfs:
+        m = squeeze.get(tf)
+        if m is None:
+            parts.append(f"{tf}:-")
+            continue
+        run, ago = m.last_squeeze_run, m.bars_since_squeeze
+        parts.append(f"{tf}:run={run},ago={ago}")
+        if 0 <= ago <= cfg.max_bars_since_squeeze and run >= cfg.min_squeeze_bars:
+            return True, tf, run, ago, " ".join(parts)
+    m1 = squeeze.get(cfg.compression_tfs[0]) if cfg.compression_tfs else None
+    return False, cfg.compression_tfs[0] if cfg.compression_tfs else "", (m1.last_squeeze_run if m1 else 0), (m1.bars_since_squeeze if m1 else -1), " ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -201,11 +220,9 @@ class ConvexSignalEngine:
             age_s = (t_ms - (bm.bar_time + HOUR_MS)) / 1000
             if age_s > cfg.max_signal_age_s:
                 reasons.append(f"stale({age_s:.0f}s after close)")
-            sq = row.squeeze.get(cfg.tf)
-            run = sq.last_squeeze_run if sq else 0
-            ago = sq.bars_since_squeeze if sq else -1
-            if cfg.require_squeeze and (ago < 0 or ago > cfg.max_bars_since_squeeze or run < cfg.min_squeeze_bars):
-                reasons.append(f"no_squeeze(run={run},ago={ago})")
+            comp_ok, sq_tf, run, ago, comp_note = compression_check(row.squeeze, cfg)
+            if cfg.require_squeeze and not comp_ok:
+                reasons.append(f"no_squeeze({comp_note})")
             if not bm.vol_z >= cfg.vol_z_min:       # NaN fails too
                 reasons.append(f"vol_z={bm.vol_z:.2f}<{cfg.vol_z_min}")
             tol = int(cfg.oi_tolerance_s * 1000)
@@ -214,11 +231,12 @@ class ConvexSignalEngine:
             if oi_close is None:
                 oi_close = row.ctx.open_interest
             if oi_open is None or oi_open <= 0:
-                reasons.append("oi_history_insufficient")
+                if cfg.require_oi:
+                    reasons.append("oi_history_insufficient")
                 oi_change = float("nan")
             else:
                 oi_change = oi_close / oi_open - 1.0
-                if oi_change < cfg.oi_min_change:
+                if cfg.require_oi and oi_change < cfg.oi_min_change:
                     reasons.append(f"oi_change={oi_change:+.2%}<{cfg.oi_min_change:.0%}")
 
             ref = row.ctx.mark_px
@@ -230,7 +248,7 @@ class ConvexSignalEngine:
                                bar_time=bm.bar_time, ref_px=ref, close=bm.close, high=bm.high, low=bm.low,
                                donchian_upper=bm.donchian_upper, donchian_lower=bm.donchian_lower, vol_z=bm.vol_z,
                                oi_open=oi_open or float("nan"), oi_close=oi_close, oi_change=oi_change,
-                               squeeze_run=run, bars_since_squeeze=ago, atr=bm.atr, stop_px=stop)
+                               squeeze_run=run, bars_since_squeeze=ago, atr=bm.atr, stop_px=stop, squeeze_tf=sq_tf)
             if self.store:
                 self.store.write_signal(sig, not reasons, reasons)
             if reasons:
@@ -238,9 +256,9 @@ class ConvexSignalEngine:
                 log.info("convex reject %s %s bar %s: %s", coin, sig.side, utc(bm.bar_time), "; ".join(reasons))
             else:
                 signals.append(sig)
-                log.warning("CONVEX %s %s bar %s close %g (donchian %g/%g) vol_z %.1f OI %+.1f%% squeeze %d bars "
+                log.warning("CONVEX %s %s bar %s close %g (donchian %g/%g) vol_z %.1f OI %+.1f%% %s squeeze %d bars "
                             "ended %d ago stop %g", coin, sig.side.upper(), utc(bm.bar_time), bm.close,
-                            bm.donchian_upper, bm.donchian_lower, bm.vol_z, oi_change * 100, run, ago, stop)
+                            bm.donchian_upper, bm.donchian_lower, bm.vol_z, oi_change * 100, sq_tf, run, ago, stop)
         return signals
 
 

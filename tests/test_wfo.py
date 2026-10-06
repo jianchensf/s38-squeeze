@@ -21,23 +21,24 @@ def mk(i, o, h, l, c, v):
     return Candle(t, t + HOUR_MS - 1, o, h, l, c, v, 10)
 
 
-def breakout_series() -> list:
-    """60 flat bars in a squeeze, a volume breakout at bar 60, a four-bar rally, then a reversal that hits the Chandelier."""
+def breakout_series(n_flat: int = 60) -> list:
+    """n_flat flat bars in a squeeze, a volume breakout at bar n_flat, a four-bar rally, then a reversal that hits the Chandelier."""
     bars = []
-    for i in range(60):
+    for i in range(n_flat):
         c = 100.0 + (0.3 if i % 2 else -0.3)
         bars.append(mk(i, c, c + 1.0, c - 1.0, c, 900.0 if i % 2 else 1100.0))
-    bars.append(mk(60, 100.3, 111.0, 99.5, 110.0, 5000.0))
+    bars.append(mk(n_flat, 100.3, 111.0, 99.5, 110.0, 5000.0))
     path = [(110.0, 113.0, 109.5, 112.0), (112.0, 116.0, 111.0, 115.0), (115.0, 120.0, 114.0, 119.0),
             (119.0, 124.0, 117.0, 118.0), (118.0, 119.0, 112.0, 113.0), (113.0, 114.0, 110.0, 111.0)]
-    for k, (o, h, l, c) in enumerate(path, start=61):
+    for k, (o, h, l, c) in enumerate(path, start=n_flat + 1):
         bars.append(mk(k, o, h, l, c, 1000.0))
     return bars
 
 
 def oi_samples_for(bars):
     """One sample per bar close (+60 s), like the scanner: 1000 until the breakout bar closes, 1040 after."""
-    return [(b.t + HOUR_MS + 60_000, 1040.0 if b.t >= bars[60].t else 1000.0) for b in bars]
+    brk = bars[len(bars) - 7].t
+    return [(b.t + HOUR_MS + 60_000, 1040.0 if b.t >= brk else 1000.0) for b in bars]
 
 
 def run(coro):
@@ -93,6 +94,57 @@ def test_replay_reproduces_the_live_book():
     assert abs(live_trade.avg_px - st.entry) < 0.02                      # 110.08 (tick-rounded bound) vs 110.088
     assert abs(live_r - st.r) < 0.01 and 1.0 < st.r < 1.4
     assert math.isclose(st.exit, 114.9 * 0.9995, rel_tol=1e-3)           # Chandelier 124 − 2.5 × ATR14(3.64), −5 bps
+
+
+def test_compression_rule_1h_or_4h_in_engine_and_replay():
+    """A coin whose 1h squeeze ended long ago but whose 4h squeeze is fresh qualifies under the live rule."""
+    from convex_engine import compression_check
+    from squeeze_scanner import SqueezeMetrics
+
+    def sq(tf, run, ago):
+        return SqueezeMetrics(tf=tf, bar_time=0, close=1, bb_basis=1, bb_upper=1, bb_lower=1, kc_basis=1, kc_upper=1, kc_lower=1,
+                              atr=1, bb_width=0, squeeze_ratio=1, squeeze_on=False, squeeze_bars=0, prev_squeeze_bars=0,
+                              bars_since_squeeze=ago, last_squeeze_run=run, released=False, release_dir=0, bbw_pctile=0.5,
+                              range_pos=0.5, n_bars=100)
+    cfg = BreakoutConfig()
+    assert compression_check({"1h": sq("1h", 1, 32), "4h": sq("4h", 6, 1)}, cfg)[:2] == (True, "4h")
+    assert compression_check({"1h": sq("1h", 5, 1), "4h": sq("4h", 6, 9)}, cfg)[:2] == (True, "1h")
+    assert compression_check({"1h": sq("1h", 1, 32), "4h": sq("4h", 6, 9)}, cfg)[0] is False
+    assert compression_check({"1h": sq("1h", 1, 32), "4h": sq("4h", 2, 1)}, cfg)[0] is False        # 4h run too short
+    assert compression_check({"1h": sq("1h", 1, 32), "4h": sq("4h", 6, 1)}, BreakoutConfig(compression_tfs=("1h",)))[0] is False
+    assert compression_check({"1h": sq("1h", 1, 32)}, cfg)[0] is False                                # no 4h metrics at all
+
+    # replay: 160 flat 1h bars = 40 flat 4h bars → the 4h squeeze is on too; each rule alone carries the breakout
+    bars = breakout_series(160)
+    k = 160
+    s = build_series("X", bars, {b.t + HOUR_MS for b in bars}, oi_samples_for(bars), BreakoutConfig())
+    assert s.sq4_run[k] >= 3 and 0 <= s.sq4_ago[k] <= 2 and s.sq_run[k] >= 3 and s.sq_ago[k] == 1
+    assert signals_for(s, 20, BreakoutConfig(compression_tfs=("4h",)))[k] == 1
+    assert signals_for(s, 20, BreakoutConfig(compression_tfs=("1h",)))[k] == 1
+    assert signals_for(s, 20, BreakoutConfig(require_oi=False))[k] == 1
+    # a 1h squeeze that ended 30 bars ago fails the 1h rule but a fresh 4h squeeze still qualifies
+    s.sq_ago[:] = 30
+    assert signals_for(s, 20, BreakoutConfig(compression_tfs=("1h",)))[k] == 0
+    assert signals_for(s, 20, BreakoutConfig(compression_tfs=("1h", "4h")))[k] == 1
+    # without OI samples the OI-gated rule finds nothing, the study's rule does
+    s2 = build_series("X", bars, {b.t + HOUR_MS for b in bars}, [], BreakoutConfig())
+    assert signals_for(s2, 20, BreakoutConfig())[k] == 0 and signals_for(s2, 20, BreakoutConfig(require_oi=False))[k] == 1
+
+
+def test_study_variants_nest():
+    from dataclasses import replace
+    from study import VARIANTS, report_variant
+    bars = breakout_series()
+    s = build_series("X", bars, {b.t + HOUR_MS for b in bars}, [], BreakoutConfig(require_oi=False))
+    base = BreakoutConfig(require_oi=False)
+    free = WFOConfig(max_positions=10_000, cooldown_bars=0)
+    counts = {}
+    for name, over in VARIANTS:
+        trades = simulate({"X": s}, 20, 2.5, bars[0].t, bars[-1].t + HOUR_MS, free, replace(base, **over), RiskConfig())
+        counts[name] = len(trades)
+        text, out = report_variant(name, trades, bars[0].t, bars[-1].t + HOUR_MS, 0.01)
+        assert name in text and ("too few trades" in text) and out["all"]["n"] == len(trades)
+    assert counts["D"] >= counts["DV"] >= counts["DVC"] >= counts["DVC1"] >= 1
 
 
 def test_set_stats_and_gate():
@@ -199,4 +251,29 @@ def test_trade_log_enrichment_and_events(tmp_path):
     kinds = [k for (k,) in store.con.execute("SELECT kind FROM position_events ORDER BY ts, rowid")]
     assert kinds[0] == "open" and kinds[-1] == "close" and kinds.count("stop_move") >= 2
     assert pos.status == "closed"
+    store.close()
+
+
+def test_fetch_candles_fills_the_head_of_a_partial_cache(tmp_path):
+    """The weekly WFO caches the last 30 days; a 200-day study must fetch the missing head, not just extend the tail."""
+    from wfo import fetch_candles
+
+    bars = [mk(i, 100.0, 101.0, 99.0, 100.0, 1000.0) for i in range(300)]
+    t_end = bars[-1].t + HOUR_MS + 5 * 60_000          # 5 min after the last bar closed
+    calls = []
+
+    class Client:
+        async def candles(self, coin, interval, a, b):
+            calls.append((coin, a, b))
+            return [c for c in bars if a <= c.t <= b] if coin == "AAA" else []
+
+    store = Store(str(tmp_path / "fc.db"))
+    store.write_candles("AAA", bars[200:])              # tail only, as the WFO would have left it
+    out = asyncio.run(fetch_candles(store, Client(), ["AAA", "NEW"], bars[0].t, t_end))
+    assert [c.t for c in out["AAA"]] == [c.t for c in bars]        # head filled, nothing duplicated
+    assert len([c for c in calls if c[0] == "AAA"]) == 1 and calls[0][1] == bars[0].t and calls[0][2] < bars[200].t
+    assert "NEW" not in out and len([c for c in calls if c[0] == "NEW"]) == 1   # unknown coin: one empty request, no entry
+    calls.clear()
+    out = asyncio.run(fetch_candles(store, Client(), ["AAA"], bars[0].t, t_end))
+    assert calls == [] and len(out["AAA"]) == 300                   # fully cached: no request
     store.close()

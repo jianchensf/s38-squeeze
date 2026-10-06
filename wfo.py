@@ -79,6 +79,8 @@ class CoinSeries:
     atr: np.ndarray             # ATR(atr_len) per bar
     sq_ago: np.ndarray          # bars since the 1h squeeze was last on (−1 never)
     sq_run: np.ndarray          # length of that squeeze run
+    sq4_ago: np.ndarray         # same, in 4h bars, from the last 4h bar closed by this 1h bar's close
+    sq4_run: np.ndarray
     vol_z: np.ndarray           # bar volume vs the prior vol_len bars
     eligible: np.ndarray        # bool: coin was in the scanned universe in the hour after the bar closed
     oi_open: np.ndarray         # OI sample within tolerance of the bar open (NaN if none)
@@ -101,6 +103,28 @@ def _nearest(samples_t: np.ndarray, samples_v: np.ndarray, at: np.ndarray, tol_m
     return out
 
 
+def squeeze_4h_for_1h(t: np.ndarray, o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray,
+                      scfg: SqueezeConfig) -> tuple:
+    """Aggregate 1h bars to the UTC 4h grid, run the squeeze on it, and map (ago, run) back to each 1h bar using
+    the last 4h bar that had CLOSED when the 1h bar closed — what the live scanner's 4h metrics show at that time."""
+    n = len(t)
+    ago1h, run1h = np.full(n, -1, dtype=int), np.zeros(n, dtype=int)
+    if n == 0:
+        return ago1h, run1h
+    g = (t // (4 * HOUR_MS)) * (4 * HOUR_MS)
+    starts = np.unique(g)
+    h4 = np.array([h[g == s].max() for s in starts]); l4 = np.array([l[g == s].min() for s in starts])
+    c4 = np.array([c[g == s][-1] for s in starts])
+    if len(starts) < scfg.length + 1:
+        return ago1h, run1h
+    ago4, run4 = squeeze_recency(squeeze_bands(h4, l4, c4, scfg)["on"])
+    closes4 = starts + 4 * HOUR_MS
+    j = np.searchsorted(closes4, t + HOUR_MS, side="right") - 1      # last 4h bar closed by this 1h close
+    ok = j >= 0
+    ago1h[ok], run1h[ok] = ago4[j[ok]], run4[j[ok]]
+    return ago1h, run1h
+
+
 def build_series(coin: str, candles: Sequence[Candle], eligible_hours: set, oi_samples: Sequence,
                  bcfg: BreakoutConfig, scfg: SqueezeConfig = SqueezeConfig()) -> Optional[CoinSeries]:
     n = len(candles)
@@ -111,6 +135,7 @@ def build_series(coin: str, candles: Sequence[Candle], eligible_hours: set, oi_s
     l = np.array([c.l for c in candles]); c_ = np.array([c.c for c in candles]); v = np.array([c.v for c in candles])
     atr = sma(true_range(h, l, c_), bcfg.atr_len)
     ago, run = squeeze_recency(squeeze_bands(h, l, c_, scfg)["on"])
+    ago4, run4 = squeeze_4h_for_1h(t, o, h, l, c_, scfg)
     m = bcfg.vol_len
     vol_z = np.full(n, np.nan)
     if n > m:
@@ -124,7 +149,7 @@ def build_series(coin: str, candles: Sequence[Candle], eligible_hours: set, oi_s
     st = np.array([s[0] for s in oi_samples], dtype=np.int64)
     sv = np.array([s[1] for s in oi_samples], dtype=float)
     tol = int(bcfg.oi_tolerance_s * 1000)
-    return CoinSeries(coin, t, o, h, l, c_, v, atr, ago, run, vol_z, eligible,
+    return CoinSeries(coin, t, o, h, l, c_, v, atr, ago, run, ago4, run4, vol_z, eligible,
                       _nearest(st, sv, t, tol), _nearest(st, sv, t + HOUR_MS, tol), {int(x): i for i, x in enumerate(t)})
 
 
@@ -145,9 +170,15 @@ def signals_for(s: CoinSeries, L: int, bcfg: BreakoutConfig) -> np.ndarray:
         d = np.where(s.c > upper, 1, np.where(s.c < lower, -1, 0))
         if not bcfg.allow_shorts:
             d = np.where(d < 0, 0, d)
-        ok = s.eligible & (s.vol_z >= bcfg.vol_z_min) & (s.oi_open > 0) & (s.oi_close / s.oi_open - 1.0 >= bcfg.oi_min_change)
+        ok = s.eligible & (s.vol_z >= bcfg.vol_z_min)
+        if bcfg.require_oi:
+            ok &= (s.oi_open > 0) & (s.oi_close / s.oi_open - 1.0 >= bcfg.oi_min_change)
         if bcfg.require_squeeze:
-            ok &= (s.sq_ago >= 0) & (s.sq_ago <= bcfg.max_bars_since_squeeze) & (s.sq_run >= bcfg.min_squeeze_bars)
+            comp = np.zeros(len(s.t), dtype=bool)
+            for tf, ago, run in (("1h", s.sq_ago, s.sq_run), ("4h", s.sq4_ago, s.sq4_run)):
+                if tf in bcfg.compression_tfs:
+                    comp |= (ago >= 0) & (ago <= bcfg.max_bars_since_squeeze) & (run >= bcfg.min_squeeze_bars)
+            ok &= comp
     return np.where(ok, d, 0)
 
 
@@ -371,19 +402,30 @@ def render(points: Sequence[GridPoint], chosen: dict, verdict: str, header: str,
 
 
 async def fetch_candles(store: Store, client: HLInfoClient, coins: Sequence[str], start_ms: int, end_ms: int) -> dict:
+    """1h closed bars per coin over [start_ms, end_ms], from the sqlite cache plus whatever it lacks at either end
+    (the weekly WFO caches 30 days; a 200-day study must fetch the head, not just the tail). A coin listed after
+    start_ms costs one empty head request per run. HL serves at most 5000 bars per request (≈ 208 days)."""
     out: dict = {}
     last_closed = last_closed_open_time("1h", end_ms)
     for coin in coins:
         have = store.read_candles(coin, start_ms, last_closed)
-        fetch_from = (have[-1].t + HOUR_MS) if have else start_ms
-        if fetch_from <= last_closed:
+        spans = []
+        if not have:
+            spans.append((start_ms, end_ms))
+        else:
+            if have[0].t > start_ms + HOUR_MS:
+                spans.append((start_ms, have[0].t - 1))
+            if have[-1].t + HOUR_MS <= last_closed:
+                spans.append((have[-1].t + HOUR_MS, end_ms))
+        for a, b in spans:
             try:
-                new = [c for c in await client.candles(coin, "1h", fetch_from, end_ms) if c.t <= last_closed]
+                new = [c for c in await client.candles(coin, "1h", a, b) if c.t <= last_closed]
                 if new:
                     store.write_candles(coin, new)
-                    have = store.read_candles(coin, start_ms, last_closed)
             except Exception as e:
                 log.warning("candles %s: %s", coin, e)
+        if spans:
+            have = store.read_candles(coin, start_ms, last_closed)
         if have:
             out[coin] = have
     return out

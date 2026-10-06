@@ -14,7 +14,7 @@ the realized paper record before any capital is attached.
 POST /info metaAndAssetCtxs ─► universe filter ─► closed-bar candles (1h, 4h) ─► BB(20,2) vs KC(20,1.5) squeeze
                             └► current funding + 24h fundingHistory ───────────► short-squeeze fuel
 ─► ScanRow per coin ─► StateEngine ─► sinks: stdout table · sqlite · Telegram (optional) · dry-run intents
-                    └► ConvexSignalEngine (Donchian + vol z ≥ 2.5 + OI ≥ +3 %) ─► ConvexExecutor (IOC ± 0.08 %)
+                    └► ConvexSignalEngine (1h|4h compression + Donchian + vol z ≥ 2.5 + OI ≥ +3 %) ─► ConvexExecutor (IOC ± 0.08 %)
                        ConvexRiskManager: ¼-Kelly ≤ 4 % · 1.5×ATR14 stop · +2R break-even · +3R Chandelier 2.5×ATR
                        PositionBook: paper/live positions · stop replacement · 6 %/24 h breaker → flatten, 12 h halt
 weekly wfo.py: replay of the logged window over Donchian 16–32 × Chandelier 2.0–3.2 ─► WFE > 0.7 & OOS DD < 10 % gate
@@ -25,8 +25,9 @@ weekly wfo.py: replay of the logged window over Donchian 16–32 × Chandelier 2
 
 ```bash
 make setup                 # python3 -m venv .venv && pip install -r requirements.txt
-make test                  # 45 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
+make test                  # 48 offline tests: indicator math, convex filters, executor vs fake gateway, Kelly/ratchet/breaker, paper + live book, WFO replay ≡ live book, gate, fake /info server end-to-end
 make stress                # expectancy / streak / drawdown Monte Carlo on the stated profile (no market data)
+make study                 # ~200-day replay of the current universe, nested filter variants with n and SE (API, ~10 min)
 make once                  # one cycle, prints the table (first run loads ~2 candle series per coin)
 make once ARGS=--convex    # same, plus the breakout engine in dry mode
 make run ARGS=--convex     # loop every 60s; Ctrl-C to stop
@@ -84,8 +85,11 @@ validated predictor — see "Next".
 each (coin, bar) is judged exactly once and written to `signals` with `accepted` and the list of reasons. A
 signal needs all five:
 
-1. **Compression** — the 1h squeeze held ≥ 3 bars and ended ≤ 2 bars ago (or is still on): `bars_since_squeeze`,
-   `last_squeeze_run` from `compute_squeeze`.
+1. **Compression** — a squeeze that held ≥ 3 bars and ended ≤ 2 bars ago (or is still on), on the **1h or the 4h**
+   grid (`bars_since_squeeze`, `last_squeeze_run` from `compute_squeeze`; the first TF that qualifies is recorded
+   as `squeeze_tf`). The 1h-only rule was the binding filter on day one — 30 breakout bars, 0 accepted, 1h
+   squeeze ended too long ago on all of them — and a 4h squeeze (≥ 12 h of compression) is the stronger version of
+   the same thesis, so both are accepted since 2026-10-06. Rejections print both: `no_squeeze(1h:run=2,ago=7 4h:-)`.
 2. **Breakout** — bar close > max high of the *prior* 20 bars → long; < min low of the prior 20 → short. The
    breakout bar is excluded from its own channel.
 3. **Volume anomaly** — `z = (v_bar − mean(v_prior20)) / σ(v_prior20) ≥ 2.5` (population σ; zero dispersion ⇒ NaN ⇒
@@ -241,12 +245,39 @@ without touching anything; `make wfo-apply` is what the timer does. Until ~30 da
 logged the job says so and stays at baseline — at the signal rate observed on day one that is months away, which is
 itself a finding.
 
+## Historical edge study (`study.py`, `make study`)
+
+Day one of paper trading implied ~1 signal per 2–4 weeks: at that rate 20 trades take a year and the dry log
+cannot answer "is there an edge" in any useful time. `study.py` answers it offline instead: it fetches up to
+200 days of 1h candles (HL keeps 5000 bars) for every coin of the **current** universe, builds the same entry
+arrays as the live engine and replays them through the same `simulate()` / `ConvexRiskManager` exit code the WFO
+uses, in **nested variants** so each filter's contribution is visible:
+
+| variant | filters | question it answers |
+|---|---|---|
+| `D` | Donchian-20 close-out only | base rate and raw expectancy of a 20-bar breakout on these coins |
+| `DV` | + volume z ≥ 2.5 | does the volume anomaly add anything |
+| `DVC1` | + 1h compression (the rule as first specified) | how much the original rule throws away |
+| `DVC` | + 1h-or-4h compression (the rule now live) | the live entry rule without the OI filter |
+| `DVC/3` | `DVC` with the book's limits (3 positions, 24-bar cooldown) | what would actually have traded |
+
+Each variant reports n, win rate ± SE, average R ± SE, payoff, ΣR, annualised Sharpe ± SE, max drawdown at 1 %
+risk per trade, trades/day, and a verdict (`positive at xσ` / `not distinguishable from zero` / `negative`), for
+all trades, per leg, and per half of the window (regime check). Costs are the paper book's: 3.5 bps fee + 6 bps
+slippage per leg. Output is printed and saved as JSON under `state/`. Run it on the box (`python3 study.py
+--weight 300`, ~10 min for 48 coins at the shared-IP budget; `--coins`, `--days`, `--long-only` to narrow).
+
+**What it cannot measure:** the OI-inflow filter (HL has no OI history; its marginal value only shows in the dry
+log). **What biases it:** survivorship — today's $2–40M universe applied to its own past includes coins that
+grew into the band and excludes those that died out of it; paper fills at the IOC bound; one 200-day window is
+one regime. A variant that only looks good in one half, or whose long and short legs disagree, is not evidence.
+
 ## Output
 
 Table legend is printed under each table. sqlite tables (`state/s38.db`): `scans` (one row per coin per cycle:
 price, funding, OI in coin units, volume, spread, both TFs' squeeze metrics, fuel, state, score), `events` (every
 state transition, FIRE rows carry the intent JSON), `funding_hourly` (realized hourly prints), `universe`
-(eligibility counts), `signals` (one row per evaluated breakout bar with every filter value, `accepted`, `reasons`),
+(eligibility counts), `signals` (one row per evaluated breakout bar with every filter value, `squeeze_tf`, `accepted`, `reasons`),
 `orders` (every execution report: plan, fill, slippage, stop, raw exchange response), `positions` (open and closed,
 with stop stage, best excursion, stop oid), `position_events` (open / stop_move / close as they happen), `trades`
 (closed trades: entry, exit, duration, slippage, fees, funding, R net, reason), `breaker` (trips), `params` (active
@@ -302,7 +333,7 @@ itself on first start; the installer also enables the weekly `s38-wfo.timer` —
 - Exits are stop-based only (invalidation → break-even → Chandelier). No take-profit by design, no time stop.
 - Paper fills assume the whole size fills at the IOC bound; thin books will do worse live.
 - Nothing here is a backtest. The squeeze → expansion thesis, the volume/OI filters, the stop placement and the
-  35 % / 4.5:1 target profile are all unvalidated on HL mid-caps until the study below is done. Kelly sizing only
+  35 % / 4.5:1 target profile are all unvalidated on HL mid-caps until `make study` (above) and the dry log say otherwise. Kelly sizing only
   engages once 20 realized trades exist and switches itself off if the realized edge is not positive.
 
 ## Graduation
@@ -310,10 +341,10 @@ itself on first start; the installer also enables the weekly `s38-wfo.timer` —
 1. Run `--convex` in dry mode on hospitality1 and let `signals` / `orders` / `trades` accumulate. Review with
    `make signals`, `make orders`, `make positions`, `make trades`: how many breakouts pass each filter, where the
    paper fills were, how the ratchet exited them, and the realized win rate / payoff with standard errors.
-2. **Historical study** (proposed, not started): squeeze releases and Donchian/volume/OI breakouts on the current
-   universe from `candleSnapshot` (up to 5000 1h bars ≈ 200 days per coin): forward |return| and signed return at
-   4/12/24/48 bars, split by direction, by fuel / no fuel and by 4h confirmation; n, mean, median, SE, skew, hit rate
-   per leg against unconditional bars of the same coins. OI cannot be backtested (no history endpoint), so the OI
-   filter's marginal value can only be measured live from the dry log.
+2. **Historical study** (`make study`, section above): the same entry and exit code replayed over ~200 days of
+   the current universe in nested variants, with n and standard errors per leg and per half. The bar: `DVC`
+   positive at ≥ 2σ on n ≥ 50, both halves and both legs with the same sign, and the live rule not worse than the
+   plain breakout after costs. OI cannot be backtested (no history endpoint), so the OI filter's marginal value
+   can only be measured live from the dry log.
 3. Only if 1–2 hold up: `--live` on a dedicated $1k sub-account driven by an API wallet, `--max-positions 3`,
    1 % bootstrap risk; Kelly takes over from the 21st live trade.

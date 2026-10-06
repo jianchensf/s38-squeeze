@@ -960,6 +960,7 @@ class Store:
         ("trades", "exit_slip_bps", "REAL"),
         ("trades", "funding_usd", "REAL"),
         ("positions", "ref_px", "REAL"),
+        ("signals", "squeeze_tf", "TEXT"),          # v5 → which timeframe's squeeze satisfied the compression rule
     )
 
     def __init__(self, path: str):
@@ -1021,10 +1022,12 @@ class Store:
 
     def write_signal(self, s: Any, accepted: bool, reasons: Sequence[str]) -> None:
         self.con.execute(
-            f"INSERT OR REPLACE INTO signals VALUES ({','.join('?' * 20)})",
+            "INSERT OR REPLACE INTO signals (ts, coin, side, bar_time, ref_px, close, high, low, donchian_upper, donchian_lower, "
+            "vol_z, oi_open, oi_close, oi_change, squeeze_run, bars_since_squeeze, atr, stop_px, accepted, reasons, squeeze_tf) "
+            f"VALUES ({','.join('?' * 21)})",
             (s.ts, s.coin, s.side, s.bar_time, s.ref_px, s.close, s.high, s.low, s.donchian_upper, s.donchian_lower,
              s.vol_z, s.oi_open, s.oi_close, s.oi_change, s.squeeze_run, s.bars_since_squeeze, s.atr, s.stop_px,
-             int(accepted), "; ".join(reasons)))
+             int(accepted), "; ".join(reasons), getattr(s, "squeeze_tf", "1h")))
         self.con.commit()
 
     def write_order(self, r: Any) -> None:
@@ -1120,6 +1123,9 @@ class Store:
     def logged_span(self) -> tuple:
         row = self.con.execute("SELECT MIN(ts), MAX(ts) FROM scans").fetchone()
         return (int(row[0]), int(row[1])) if row and row[0] else (0, 0)
+
+    def latest_universe(self) -> list:
+        return [c for (c,) in self.con.execute("SELECT DISTINCT coin FROM scans WHERE ts = (SELECT MAX(ts) FROM scans) ORDER BY coin")]
 
     def trade_r_multiples(self, mode: str) -> list:
         return [r for (r,) in self.con.execute("SELECT r_multiple FROM trades WHERE mode=? ORDER BY closed_ms", (mode,))]
@@ -1333,13 +1339,13 @@ def show_db(path: str, what: str, n: int = 30) -> None:
                 "SELECT ts, coin, kind, state_from, state_to, direction, mark_px, note FROM events ORDER BY ts DESC LIMIT ?", (n,)):
             print(f"{utc(ts):<18}{coin:<9}{kind:<13}{f:<9}{t:<9}{d:>4}{px:>11.6g}  {note}")
     elif what == "signals":
-        print(f"{'BAR (UTC)':<18}{'COIN':<9}{'SIDE':<6}{'CLOSE':>11}{'DONCH':>11}{'VOL_Z':>7}{'OI%':>7}{'SQZ':>5}{'AGO':>4}{'STOP':>11} OK REASONS")
-        for bt, coin, side, close, du, dl, vz, oic, run, ago, stop, ok, reasons in con.execute(
+        print(f"{'BAR (UTC)':<18}{'COIN':<9}{'SIDE':<6}{'CLOSE':>11}{'DONCH':>11}{'VOL_Z':>7}{'OI%':>7}{'SQZ':>7}{'AGO':>4}{'STOP':>11} OK REASONS")
+        for bt, coin, side, close, du, dl, vz, oic, run, ago, stop, ok, reasons, sqtf in con.execute(
                 "SELECT bar_time, coin, side, close, donchian_upper, donchian_lower, vol_z, oi_change, squeeze_run, "
-                "bars_since_squeeze, stop_px, accepted, reasons FROM signals ORDER BY bar_time DESC LIMIT ?", (n,)):
+                "bars_since_squeeze, stop_px, accepted, reasons, squeeze_tf FROM signals ORDER BY bar_time DESC LIMIT ?", (n,)):
             band = du if side == "long" else dl
             print(f"{utc(bt):<18}{coin:<9}{side:<6}{close:>11.6g}{band:>11.6g}{g(vz, '.1f'):>7}"
-                  f"{g(oic * 100 if oic is not None else None, '+.1f'):>7}{run:>5}{ago:>4}{stop:>11.6g} {'Y' if ok else '-':>2} {reasons}")
+                  f"{g(oic * 100 if oic is not None else None, '+.1f'):>7}{str(run) + (sqtf or '1h')[:2]:>7}{ago:>4}{stop:>11.6g} {'Y' if ok else '-':>2} {reasons}")
     elif what == "orders":
         print(f"{'UTC':<18}{'COIN':<9}{'SIDE':<6}{'MODE':<5}{'STATUS':<9}{'SZ':>9}{'BOUND':>11}{'REF':>11}{'FILLED':>9}{'AVG':>11}{'SLIP':>6}{'STOP':>11} NOTE")
         for ts, coin, side, mode, st, sz, bound, ref, filled, avg, slip, stop, err in con.execute(
